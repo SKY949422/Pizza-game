@@ -1,6 +1,6 @@
 -- ========================================================
--- [ 7414 TD MACRO SUITE - Alliance Tower Defense 旗艦修復版 ]
--- 徹底修復 580/60 誤抓 + 嚴格勝負判定 + 極速秒放秒升 + Webhook
+-- [ 7414 TD MACRO SUITE - Alliance Tower Defense 終極修復版 ]
+-- 徹底修復放塔誤判與步驟狂跳 + 全新塔實體比對 + Webhook 戰報
 -- ========================================================
 
 if _G.Suite7414_NewGame_Running then
@@ -63,7 +63,7 @@ local towerPositionCache = {}
 local lastSelectedTower = nil
 local lastSelectedPos = nil
 
--- 波次進度追蹤 (波次範圍防呆)
+-- 波次進度追蹤
 local currentMatchWave = 0
 local currentMatchMaxWave = 60
 local highestWaveReached = 0
@@ -125,7 +125,7 @@ local function safeGetPosition(inst)
     if not inst or typeof(inst) ~= "Instance" then return nil end
     local pos = nil
     pcall(function()
-        if inst:IsA("Model") then
+        if inst.ClassName == "Model" then
             local root = inst.PrimaryPart or inst:FindFirstChild("HumanoidRootPart") or inst:FindFirstChildWhichIsA("BasePart")
             if root then
                 pos = root.Position
@@ -157,7 +157,7 @@ end)
 
 local function findNearestTower(targetPos, maxDist, preferredName)
     local bestTower = nil
-    local minDistance = maxDist or 10
+    local minDistance = maxDist or 8
     local towersFolder = workspace:FindFirstChild("Towers")
 
     if towersFolder and targetPos then
@@ -179,7 +179,7 @@ local function findNearestTower(targetPos, maxDist, preferredName)
 end
 
 -- --------------------------------------------------------
--- 3. GUI 與波次檢測 (★ 嚴格限定 Wave 字樣，杜絕 580 誤抓)
+-- 3. GUI 與波次檢測 (防呆與嚴格勝負判定)
 -- --------------------------------------------------------
 local function isGuiElementVisible(obj)
     if not obj or not obj:IsA("GuiObject") then return false end
@@ -188,7 +188,7 @@ local function isGuiElementVisible(obj)
         if not cur.Visible then return false end
         cur = cur.Parent
     end
-    if cur and cur:IsA("ScreenGui") and not cur.Enabled then return false end
+    if cur and cur.ClassName == "ScreenGui" and not cur.Enabled then return false end
     return true
 end
 
@@ -196,9 +196,8 @@ local function updateWaveInfo()
     local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
     if playerGui then
         for _, obj in ipairs(playerGui:GetDescendants()) do
-            if obj:IsA("TextLabel") and isGuiElementVisible(obj) then
+            if obj.ClassName == "TextLabel" and isGuiElementVisible(obj) then
                 local txt = obj.Text or ""
-                -- 必須嚴格包含 "wave"，絕對排除血量/盾量/金幣標籤
                 if txt:lower():find("wave") then
                     local c, m = txt:match("[Ww][Aa][Vv][Ee]%s*[:%-]?%s*(%d+)%s*/%s*(%d+)")
                     if not c then
@@ -208,7 +207,6 @@ local function updateWaveInfo()
                     if c then
                         local curNum = tonumber(c)
                         local maxNum = tonumber(m) or currentMatchMaxWave
-                        -- 嚴格防呆：當前波次絕對不可大於最大波次，且波次常態不超過 100
                         if curNum and (not m or curNum <= maxNum) and curNum <= 100 then
                             currentMatchWave = curNum
                             currentMatchMaxWave = maxNum
@@ -239,7 +237,6 @@ local function updateWaveInfo()
     return currentMatchWave, currentMatchMaxWave
 end
 
--- ★ 嚴格勝負判定核心
 local function checkGameResult()
     local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
     if not playerGui then return false, false end
@@ -250,10 +247,10 @@ local function checkGameResult()
     local defeatSignals = 0
 
     for _, gui in ipairs(playerGui:GetChildren()) do
-        if gui:IsA("ScreenGui") and gui.Enabled then
+        if gui.ClassName == "ScreenGui" and gui.Enabled then
             for _, desc in ipairs(gui:GetDescendants()) do
                 if isGuiElementVisible(desc) then
-                    if desc:IsA("TextLabel") or desc:IsA("TextButton") then
+                    if desc.ClassName == "TextLabel" or desc.ClassName == "TextButton" then
                         local txt = string.upper(desc.Text or "")
                         if txt:find("VICTORY") or txt:find("YOU WIN") or txt:find("勝利") or txt:find("STAGE CLEARED") or txt:find("GAME WON") then
                             victorySignals = victorySignals + 1
@@ -271,17 +268,12 @@ local function checkGameResult()
     end
 
     if isGameOver then
-        -- 絕對防呆法則：
-        -- 1. 最高波次根本未達到總波次（例如 27/60），100% 是輸 (Defeat)！
         if currentMatchMaxWave > 0 and highestWaveReached < currentMatchMaxWave then
             isWin = false
-        -- 2. 出現明確 Defeat 標誌
         elseif defeatSignals > 0 and defeatSignals > victorySignals then
             isWin = false
-        -- 3. 打滿了總波次且無失敗信號
         elseif currentMatchMaxWave > 0 and highestWaveReached >= currentMatchMaxWave and defeatSignals == 0 then
             isWin = true
-        -- 4. 出現明確 Victory 標誌
         elseif victorySignals > 0 and victorySignals >= defeatSignals then
             isWin = true
         else
@@ -336,9 +328,9 @@ local function scanEndScreenRewards()
     if not playerGui then return rewards end
 
     for _, gui in ipairs(playerGui:GetChildren()) do
-        if gui:IsA("ScreenGui") and gui.Enabled then
+        if gui.ClassName == "ScreenGui" and gui.Enabled then
             for _, desc in ipairs(gui:GetDescendants()) do
-                if desc:IsA("TextLabel") and isGuiElementVisible(desc) then
+                if desc.ClassName == "TextLabel" and isGuiElementVisible(desc) then
                     local txt = desc.Text or ""
                     local num, curName = txt:match("%+?(%d+[,%d]*)%s*([Cc]oins?)")
                     if not num then num, curName = txt:match("%+?(%d+[,%d]*)%s*([Gg]ems?)") end
@@ -403,7 +395,6 @@ local function sendDiscordWebhook(isVictory, wavesBeaten, isTest)
     local rewardsText = #rewardsList > 0 and table.concat(rewardsList, "\n") or "• 通關獎勵結算中"
     local playerName = UserConfig.webhookHideName and ("||" .. LocalPlayer.Name .. "||") or LocalPlayer.Name
 
-    -- 正常顯示實際打到的最高波次
     local displayWave = math.min(wavesBeaten or highestWaveReached, currentMatchMaxWave)
     local waveDisplay = string.format("Wave %d / %d %s", 
         displayWave, 
@@ -560,7 +551,7 @@ local function deleteCurrentMacro()
 end
 
 -- --------------------------------------------------------
--- 6. Hook 動作捕捉 (嚴格限定 Remote，杜絕 UI 雜訊)
+-- 6. Hook 動作捕捉 (純淨通訊過濾)
 -- --------------------------------------------------------
 local oldNamecall
 oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
@@ -569,13 +560,13 @@ oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
 
     if isRecording and not isPlaying and not checkcaller() then
         if (method == "InvokeServer" or method == "invokeServer" or method == "FireServer" or method == "fireServer") 
-           and (typeof(self) == "Instance" and (self:IsA("RemoteFunction") or self:IsA("RemoteEvent"))) then
+           and typeof(self) == "Instance" and (self.ClassName == "RemoteFunction" or self.ClassName == "RemoteEvent") then
 
             local rName = self.Name
             local lowerName = string.lower(rName)
 
             task.spawn(function()
-                -- 1. 放塔捕捉
+                -- 1. 放塔
                 if lowerName:find("place") or lowerName:find("spawn") or lowerName:find("summon") then
                     local targetCFrame = nil
                     local targetTowerName = "Unknown Tower"
@@ -604,7 +595,7 @@ oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
                         print(string.format("[ATD 捕捉] 放塔: %s (步數: %d)", tostring(targetTowerName), #recordedActions))
                     end
 
-                -- 2. 升級塔捕捉
+                -- 2. 升級塔
                 elseif lowerName:find("upgradetower") then
                     local now = os.clock()
                     if (now - lastActionTime) > 0.15 then
@@ -629,7 +620,7 @@ oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
                         print(string.format("[ATD 捕捉] 升級塔: %s (步數: %d)", tostring(tName), #recordedActions))
                     end
 
-                -- 3. 賣塔捕捉
+                -- 3. 賣塔
                 elseif lowerName:find("selltower") then
                     local now = os.clock()
                     local delay = (#recordedActions == 0) and 0 or (now - lastActionTime)
@@ -676,7 +667,7 @@ UserInputService.InputBegan:Connect(function(input, gpe)
 end)
 
 -- --------------------------------------------------------
--- 7. 巨集重播核心 (極速秒放 + 等錢秒升 + 精準賣塔)
+-- 7. 巨集重播核心 (全新塔實體比對，徹底杜絕步驟狂跳)
 -- --------------------------------------------------------
 runPlayMacro = function(st)
     if isRecording then return end
@@ -689,7 +680,7 @@ runPlayMacro = function(st)
 
         task.spawn(function()
             isPlaying = true
-            print(string.format("[ATD 極速重播啟動] 執行「%s」，共 %d 步", currentMacroName, #recordedActions))
+            print(string.format("[ATD 重播啟動] 執行「%s」，共 %d 步 (全精準判定模式)", currentMacroName, #recordedActions))
 
             for i, step in ipairs(recordedActions) do
                 if not isPlaying or not _G.Suite7414_NewGame_Running or not UserConfig.playMacro then break end
@@ -701,58 +692,82 @@ runPlayMacro = function(st)
 
                 if not isPlaying or not _G.Suite7414_NewGame_Running or not UserConfig.playMacro then break end
 
-                -- 1. 放塔
+                -- 1. 放塔 (★ 全新實體比對，絕不誤判舊塔)
                 if step.type == "Place" then
                     local rTarget = (ReplicatedStorage:FindFirstChild("RemoteFunctions") and ReplicatedStorage.RemoteFunctions:FindFirstChild(step.remoteName or "PlaceTower"))
                         or (ReplicatedStorage:FindFirstChild("RemoteEvents") and ReplicatedStorage.RemoteEvents:FindFirstChild(step.remoteName or "PlaceTower"))
 
                     if rTarget then
-                        local startTime = os.clock()
                         while isPlaying and _G.Suite7414_NewGame_Running and UserConfig.playMacro do
-                            local isGameOver = checkGameResult()
-                            if isGameOver then break end
+                            if checkGameResult() then break end
 
-                            if os.clock() - startTime > 4.0 then
-                                print(string.format("[ATD 提示] (%d/%d) 放塔超時，跳過此步", i, #recordedActions))
+                            local currentTowers = workspace:FindFirstChild("Towers")
+                            local currentCount = currentTowers and #currentTowers:GetChildren() or 0
+
+                            -- 只有在真正達到 10/10 滿載時才跳過
+                            if currentCount >= 10 then
+                                print(string.format("[ATD 提示] (%d/%d) 塔位已滿 10/10，跳過此放塔步驟", i, #recordedActions))
                                 break
+                            end
+
+                            -- 截圖當前場上現存的所有塔
+                            local beforeTowers = {}
+                            if currentTowers then
+                                for _, t in ipairs(currentTowers:GetChildren()) do
+                                    beforeTowers[t] = true
+                                end
                             end
 
                             local res = nil
                             pcall(function()
-                                if rTarget:IsA("RemoteFunction") then
+                                if rTarget.ClassName == "RemoteFunction" then
                                     res = rTarget:InvokeServer(step.towerName, step.cframe)
                                 else
                                     rTarget:FireServer(step.towerName, step.cframe)
-                                    res = true
                                 end
                             end)
 
-                            local spawnedTower = findNearestTower(step.cframe.Position, 5, step.towerName)
-                            if (res ~= false and res ~= nil) or spawnedTower then
+                            task.wait(0.2)
+
+                            -- 檢測場上是否真正多出一隻「全新的塔」
+                            local newlyCreated = false
+                            if currentTowers then
+                                for _, t in ipairs(currentTowers:GetChildren()) do
+                                    if not beforeTowers[t] then
+                                        newlyCreated = true
+                                        local p = safeGetPosition(t)
+                                        if p then towerPositionCache[t] = p end
+                                        break
+                                    end
+                                end
+                            end
+
+                            -- 成功放下了全新的塔
+                            if newlyCreated or (res ~= false and res ~= nil and res ~= 0) then
                                 print(string.format("[ATD 放塔成功] (%d/%d) %s", i, #recordedActions, tostring(step.towerName)))
-                                task.wait(0.15)
+                                task.wait(0.2)
                                 break
                             end
-                            task.wait(0.2)
+
+                            -- 錢還不夠，正常輪詢等錢，絕不隨便跳過
+                            task.wait(0.35)
                         end
                     end
 
-                -- 2. 升級塔
+                -- 2. 升級塔 (等錢秒升)
                 elseif step.type == "Upgrade" then
                     local upgradeFunc = (ReplicatedStorage:FindFirstChild("RemoteFunctions") and ReplicatedStorage.RemoteFunctions:FindFirstChild("UpgradeTower"))
                         or (ReplicatedStorage:FindFirstChild("RemoteEvents") and ReplicatedStorage.RemoteEvents:FindFirstChild("UpgradeTower"))
 
                     if upgradeFunc and step.position then
-                        local startTime = os.clock()
                         while isPlaying and _G.Suite7414_NewGame_Running and UserConfig.playMacro do
-                            local isGameOver = checkGameResult()
-                            if isGameOver then break end
+                            if checkGameResult() then break end
 
-                            local target = findNearestTower(step.position, 8, step.towerName)
+                            local target = findNearestTower(step.position, 6, step.towerName)
                             if target then
                                 local res = nil
                                 pcall(function()
-                                    if upgradeFunc:IsA("RemoteFunction") then
+                                    if upgradeFunc.ClassName == "RemoteFunction" then
                                         res = upgradeFunc:InvokeServer(target)
                                     else
                                         upgradeFunc:FireServer(target)
@@ -760,15 +775,14 @@ runPlayMacro = function(st)
                                     end
                                 end)
 
+                                -- 升級成功才邁向下一個步驟
                                 if res ~= false and res ~= nil then
                                     print(string.format("[ATD 升級成功] (%d/%d) %s", i, #recordedActions, tostring(step.towerName)))
                                     task.wait(0.2)
                                     break
                                 end
-                            else
-                                if os.clock() - startTime > 3.0 then break end
                             end
-                            task.wait(0.2)
+                            task.wait(0.35)
                         end
                     end
 
@@ -780,25 +794,24 @@ runPlayMacro = function(st)
                     if sellFunc and step.position then
                         local startTime = os.clock()
                         while isPlaying and _G.Suite7414_NewGame_Running and UserConfig.playMacro do
-                            local isGameOver = checkGameResult()
-                            if isGameOver then break end
+                            if checkGameResult() then break end
 
-                            local target = findNearestTower(step.position, 10, step.towerName)
+                            local target = findNearestTower(step.position, 8, step.towerName)
                             if target then
                                 pcall(function()
-                                    if sellFunc:IsA("RemoteFunction") then
+                                    if sellFunc.ClassName == "RemoteFunction" then
                                         sellFunc:InvokeServer(target)
                                     else
                                         sellFunc:FireServer(target)
                                     end
                                 end)
-                                print(string.format("[ATD 賣塔成功] (%d/%d) %s", i, #recordedActions, tostring(step.towerName)))
+                                print(string.format("[ATD 賣塔成功] (%d/%d) %s (釋放塔位)", i, #recordedActions, tostring(step.towerName)))
                                 task.wait(0.3)
                                 break
                             else
                                 if os.clock() - startTime > 1.5 then break end
                             end
-                            task.wait(0.2)
+                            task.wait(0.25)
                         end
                     end
                 end
@@ -866,9 +879,9 @@ task.spawn(function()
                 local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
                 if playerGui then
                     for _, obj in ipairs(playerGui:GetDescendants()) do
-                        if obj:IsA("GuiButton") or obj:IsA("TextLabel") then
+                        if obj.ClassName == "GuiButton" or obj.ClassName == "TextLabel" then
                             if obj.Text and obj.Text:find("自動跳過") then
-                                local btn = obj:IsA("GuiButton") and obj or obj:FindFirstAncestorWhichIsA("GuiButton")
+                                local btn = (obj.ClassName == "GuiButton" and obj) or obj:FindFirstAncestorWhichIsA("GuiButton")
                                 if btn and isGuiElementVisible(btn) then
                                     pcall(function()
                                         if firesignal then
@@ -1030,9 +1043,9 @@ applyCustomTheme = function()
     brandBadge.BackgroundColor3 = targetColor
     for _, el in ipairs(accentElements) do
         if el and el.Parent then
-            if el:IsA("UIStroke") then
+            if el.ClassName == "UIStroke" then
                 el.Color = targetColor
-            elseif el:IsA("TextButton") then
+            elseif el.ClassName == "TextButton" then
                 el.TextColor3 = targetColor
             else
                 el.BackgroundColor3 = targetColor
@@ -1237,7 +1250,7 @@ macroListLayout.Padding = UDim.new(0, 4)
 updateMacroListView = function()
     refreshMacroList()
     for _, ch in ipairs(macroScroll:GetChildren()) do
-        if ch:IsA("TextButton") then ch:Destroy() end
+        if ch.ClassName == "TextButton" then ch:Destroy() end
     end
     for _, name in ipairs(macroList) do
         local isCur = (name == currentMacroName)
@@ -1283,7 +1296,7 @@ playCtrl = createSwitch(pageMacro, "執行重播 (Play Macro)", "持久開啟，
     end
 end, 2)
 
-recordCtrl = createSwitch(pageMacro, "錄製操作 (Record Macro)", "開啟後放塔、升級與賣塔 (無雜訊)", false, function(st, ctrl)
+recordCtrl = createSwitch(pageMacro, "錄製操作 (Record Macro)", "開啟後放塔、升級與賣塔", false, function(st, ctrl)
     if isPlaying then
         ctrl.Set(false)
         return
@@ -1309,7 +1322,7 @@ task.spawn(function()
             lastState = isRecording
             pcall(function()
                 if recordCtrl then
-                    recordCtrl.SetDesc(isRecording and string.format("● 錄製中... (已捕捉 %d 步動作)", #recordedActions) or "開啟後放塔、升級與賣塔 (無雜訊)")
+                    recordCtrl.SetDesc(isRecording and string.format("● 錄製中... (已捕捉 %d 步動作)", #recordedActions) or "開啟後放塔、升級與賣塔")
                 end
                 if playCtrl and not isPlaying and not UserConfig.playMacro then
                     playCtrl.SetDesc(string.format("檔案: %s (共 %d 步動作)", currentMacroName, #recordedActions))
