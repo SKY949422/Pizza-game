@@ -1,6 +1,6 @@
 -- ========================================================
--- [ 7414 TD MACRO SUITE - Alliance Tower Defense 終極修復版 ]
--- 徹底修復升級報錯 (Namecall污染修復) + 極速重播 + Webhook戰報
+-- [ 7414 TD MACRO SUITE - Alliance Tower Defense 旗艦修復版 ]
+-- 徹底修復 580/60 誤抓 + 嚴格勝負判定 + 極速秒放秒升 + Webhook
 -- ========================================================
 
 if _G.Suite7414_NewGame_Running then
@@ -63,8 +63,9 @@ local towerPositionCache = {}
 local lastSelectedTower = nil
 local lastSelectedPos = nil
 
+-- 波次進度追蹤 (波次範圍防呆)
 local currentMatchWave = 0
-local currentMatchMaxWave = 20
+local currentMatchMaxWave = 60
 local highestWaveReached = 0
 
 local runPlayMacro, playCtrl, recordCtrl
@@ -118,7 +119,7 @@ local function formatSessionTime(seconds)
 end
 
 -- --------------------------------------------------------
--- 2. 塔位快取與安全座標提取 (完全杜絕 Namecall 衝突)
+-- 2. 塔位快取與安全座標提取
 -- --------------------------------------------------------
 local function safeGetPosition(inst)
     if not inst or typeof(inst) ~= "Instance" then return nil end
@@ -139,7 +140,6 @@ local function safeGetPosition(inst)
     return pos
 end
 
--- 背景常駐刷新快取
 task.spawn(function()
     while _G.Suite7414_NewGame_Running do
         local towersFolder = workspace:FindFirstChild("Towers")
@@ -179,7 +179,7 @@ local function findNearestTower(targetPos, maxDist, preferredName)
 end
 
 -- --------------------------------------------------------
--- 3. GUI 與波次檢測
+-- 3. GUI 與波次檢測 (★ 嚴格限定 Wave 字樣，杜絕 580 誤抓)
 -- --------------------------------------------------------
 local function isGuiElementVisible(obj)
     if not obj or not obj:IsA("GuiObject") then return false end
@@ -197,17 +197,27 @@ local function updateWaveInfo()
     if playerGui then
         for _, obj in ipairs(playerGui:GetDescendants()) do
             if obj:IsA("TextLabel") and isGuiElementVisible(obj) then
-                local c, m = obj.Text:match("[Ww]ave%s*(%d+)%s*/%s*(%d+)")
-                if not c then
-                    c, m = obj.Text:match("(%d+)%s*/%s*(%d+)")
-                end
-                if c and m then
-                    currentMatchWave = tonumber(c)
-                    currentMatchMaxWave = tonumber(m)
-                    if currentMatchWave > highestWaveReached then
-                        highestWaveReached = currentMatchWave
+                local txt = obj.Text or ""
+                -- 必須嚴格包含 "wave"，絕對排除血量/盾量/金幣標籤
+                if txt:lower():find("wave") then
+                    local c, m = txt:match("[Ww][Aa][Vv][Ee]%s*[:%-]?%s*(%d+)%s*/%s*(%d+)")
+                    if not c then
+                        c = txt:match("[Ww][Aa][Vv][Ee]%s*[:%-]?%s*(%d+)")
                     end
-                    return currentMatchWave, currentMatchMaxWave
+
+                    if c then
+                        local curNum = tonumber(c)
+                        local maxNum = tonumber(m) or currentMatchMaxWave
+                        -- 嚴格防呆：當前波次絕對不可大於最大波次，且波次常態不超過 100
+                        if curNum and (not m or curNum <= maxNum) and curNum <= 100 then
+                            currentMatchWave = curNum
+                            currentMatchMaxWave = maxNum
+                            if currentMatchWave > highestWaveReached then
+                                highestWaveReached = currentMatchWave
+                            end
+                            return currentMatchWave, currentMatchMaxWave
+                        end
+                    end
                 end
             end
         end
@@ -217,15 +227,19 @@ local function updateWaveInfo()
     if info then
         local w = info:FindFirstChild("Wave") or info:FindFirstChild("CurrentWave")
         if w and w:IsA("ValueBase") and tonumber(w.Value) then
-            currentMatchWave = tonumber(w.Value)
-            if currentMatchWave > highestWaveReached then
-                highestWaveReached = currentMatchWave
+            local val = tonumber(w.Value)
+            if val <= 100 then
+                currentMatchWave = val
+                if currentMatchWave > highestWaveReached then
+                    highestWaveReached = currentMatchWave
+                end
             end
         end
     end
     return currentMatchWave, currentMatchMaxWave
 end
 
+-- ★ 嚴格勝負判定核心
 local function checkGameResult()
     local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
     if not playerGui then return false, false end
@@ -257,12 +271,19 @@ local function checkGameResult()
     end
 
     if isGameOver then
-        if victorySignals > 0 and victorySignals >= defeatSignals then
-            isWin = true
-        elseif currentMatchMaxWave > 0 and highestWaveReached >= currentMatchMaxWave then
-            isWin = true
+        -- 絕對防呆法則：
+        -- 1. 最高波次根本未達到總波次（例如 27/60），100% 是輸 (Defeat)！
+        if currentMatchMaxWave > 0 and highestWaveReached < currentMatchMaxWave then
+            isWin = false
+        -- 2. 出現明確 Defeat 標誌
         elseif defeatSignals > 0 and defeatSignals > victorySignals then
             isWin = false
+        -- 3. 打滿了總波次且無失敗信號
+        elseif currentMatchMaxWave > 0 and highestWaveReached >= currentMatchMaxWave and defeatSignals == 0 then
+            isWin = true
+        -- 4. 出現明確 Victory 標誌
+        elseif victorySignals > 0 and victorySignals >= defeatSignals then
+            isWin = true
         else
             isWin = false
         end
@@ -382,8 +403,10 @@ local function sendDiscordWebhook(isVictory, wavesBeaten, isTest)
     local rewardsText = #rewardsList > 0 and table.concat(rewardsList, "\n") or "• 通關獎勵結算中"
     local playerName = UserConfig.webhookHideName and ("||" .. LocalPlayer.Name .. "||") or LocalPlayer.Name
 
+    -- 正常顯示實際打到的最高波次
+    local displayWave = math.min(wavesBeaten or highestWaveReached, currentMatchMaxWave)
     local waveDisplay = string.format("Wave %d / %d %s", 
-        wavesBeaten or highestWaveReached, 
+        displayWave, 
         currentMatchMaxWave, 
         isVictory and "(通關)" or "(失敗)"
     )
@@ -537,7 +560,7 @@ local function deleteCurrentMacro()
 end
 
 -- --------------------------------------------------------
--- 6. Hook 動作捕捉 (★ 非同步無感攔截，徹底修復 Line 2913 報錯)
+-- 6. Hook 動作捕捉 (嚴格限定 Remote，杜絕 UI 雜訊)
 -- --------------------------------------------------------
 local oldNamecall
 oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
@@ -545,93 +568,95 @@ oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
     local args = {...}
 
     if isRecording and not isPlaying and not checkcaller() then
-        local rName = self and self.Name or ""
-        local lowerName = string.lower(rName)
+        if (method == "InvokeServer" or method == "invokeServer" or method == "FireServer" or method == "fireServer") 
+           and (typeof(self) == "Instance" and (self:IsA("RemoteFunction") or self:IsA("RemoteEvent"))) then
 
-        -- 將耗時與有 Colon Call 風險的操作丟入 task.spawn，主線程原樣通行
-        task.spawn(function()
-            -- 1. 放塔捕捉
-            if lowerName:find("place") or lowerName:find("spawn") or lowerName:find("summon") then
-                local targetCFrame = nil
-                local targetTowerName = "Unknown Tower"
+            local rName = self.Name
+            local lowerName = string.lower(rName)
 
-                for _, arg in ipairs(args) do
-                    if typeof(arg) == "CFrame" then
-                        targetCFrame = arg
-                    elseif typeof(arg) == "string" and targetTowerName == "Unknown Tower" then
-                        targetTowerName = arg
+            task.spawn(function()
+                -- 1. 放塔捕捉
+                if lowerName:find("place") or lowerName:find("spawn") or lowerName:find("summon") then
+                    local targetCFrame = nil
+                    local targetTowerName = "Unknown Tower"
+
+                    for _, arg in ipairs(args) do
+                        if typeof(arg) == "CFrame" then
+                            targetCFrame = arg
+                        elseif typeof(arg) == "string" and targetTowerName == "Unknown Tower" then
+                            targetTowerName = arg
+                        end
                     end
-                end
 
-                if targetCFrame then
+                    if targetCFrame then
+                        local now = os.clock()
+                        local delay = (#recordedActions == 0) and 0 or (now - lastActionTime)
+                        lastActionTime = now
+
+                        table.insert(recordedActions, {
+                            type = "Place",
+                            delay = delay,
+                            towerName = targetTowerName,
+                            cframe = targetCFrame,
+                            remoteName = rName,
+                            isEvent = (method == "FireServer" or method == "fireServer")
+                        })
+                        print(string.format("[ATD 捕捉] 放塔: %s (步數: %d)", tostring(targetTowerName), #recordedActions))
+                    end
+
+                -- 2. 升級塔捕捉
+                elseif lowerName:find("upgradetower") then
                     local now = os.clock()
-                    local delay = (#recordedActions == 0) and 0 or (now - lastActionTime)
-                    lastActionTime = now
+                    if (now - lastActionTime) > 0.15 then
+                        local delay = (#recordedActions == 0) and 0 or (now - lastActionTime)
+                        lastActionTime = now
 
-                    table.insert(recordedActions, {
-                        type = "Place",
-                        delay = delay,
-                        towerName = targetTowerName,
-                        cframe = targetCFrame,
-                        remoteName = rName,
-                        isEvent = (method == "FireServer" or method == "fireServer")
-                    })
-                    print(string.format("[ATD 捕捉] 放塔: %s (步數: %d)", tostring(targetTowerName), #recordedActions))
-                end
+                        local inst = args[1]
+                        local pos = safeGetPosition(inst) or towerPositionCache[inst] or lastSelectedPos
+                        local tName = (inst and typeof(inst) == "Instance" and inst.Name ~= "" and inst.Name) or (lastSelectedTower and lastSelectedTower.Name) or "Tower"
 
-            -- 2. 升級塔捕捉 (安全非同步)
-            elseif lowerName:find("upgradetower") or lowerName == "upgrade" then
-                local now = os.clock()
-                if (now - lastActionTime) > 0.15 then
+                        if inst and pos then
+                            lastSelectedTower = inst
+                            lastSelectedPos = pos
+                        end
+
+                        table.insert(recordedActions, {
+                            type = "Upgrade",
+                            delay = delay,
+                            position = pos,
+                            towerName = tName
+                        })
+                        print(string.format("[ATD 捕捉] 升級塔: %s (步數: %d)", tostring(tName), #recordedActions))
+                    end
+
+                -- 3. 賣塔捕捉
+                elseif lowerName:find("selltower") then
+                    local now = os.clock()
                     local delay = (#recordedActions == 0) and 0 or (now - lastActionTime)
                     lastActionTime = now
 
                     local inst = args[1]
                     local pos = safeGetPosition(inst) or towerPositionCache[inst] or lastSelectedPos
+                    local tName = (inst and typeof(inst) == "Instance" and inst.Name ~= "" and inst.Name) or (lastSelectedTower and lastSelectedTower.Name) or "Tower"
 
-                    if inst and pos then
-                        lastSelectedTower = inst
-                        lastSelectedPos = pos
+                    if pos then
+                        table.insert(recordedActions, {
+                            type = "Sell",
+                            delay = delay,
+                            position = pos,
+                            towerName = tName
+                        })
+                        print(string.format("[ATD 捕捉] ★ 賣塔記錄: %s (步數: %d)", tostring(tName), #recordedActions))
                     end
-
-                    table.insert(recordedActions, {
-                        type = "Upgrade",
-                        delay = delay,
-                        position = pos,
-                        towerName = inst and inst.Name or "Tower"
-                    })
-                    print(string.format("[ATD 捕捉] 升級: %s (步數: %d)", tostring(inst and inst.Name), #recordedActions))
                 end
-
-            -- 3. 賣塔捕捉 (安全非同步)
-            elseif lowerName:find("selltower") or lowerName == "sell" then
-                local now = os.clock()
-                local delay = (#recordedActions == 0) and 0 or (now - lastActionTime)
-                lastActionTime = now
-
-                local inst = args[1]
-                local pos = safeGetPosition(inst) or towerPositionCache[inst] or lastSelectedPos
-                local tName = (inst and inst.Name ~= "" and inst.Name) or (lastSelectedTower and lastSelectedTower.Name) or "Tower"
-
-                if pos then
-                    table.insert(recordedActions, {
-                        type = "Sell",
-                        delay = delay,
-                        position = pos,
-                        towerName = tName
-                    })
-                    print(string.format("[ATD 捕捉] ★ 賣塔成功記錄: %s (步數: %d)", tostring(tName), #recordedActions))
-                end
-            end
-        end)
+            end)
+        end
     end
 
-    -- ★ 嚴格還原 Namecall 指令，防止遊戲底層通訊崩潰
     setnamecallmethod(method)
     return oldNamecall(self, ...)
 end))
 
--- 監聽玩家在畫面上點選塔
 UserInputService.InputBegan:Connect(function(input, gpe)
     if not isRecording or gpe then return end
     if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
@@ -676,7 +701,7 @@ runPlayMacro = function(st)
 
                 if not isPlaying or not _G.Suite7414_NewGame_Running or not UserConfig.playMacro then break end
 
-                -- 1. 放塔 (4秒超時防卡死)
+                -- 1. 放塔
                 if step.type == "Place" then
                     local rTarget = (ReplicatedStorage:FindFirstChild("RemoteFunctions") and ReplicatedStorage.RemoteFunctions:FindFirstChild(step.remoteName or "PlaceTower"))
                         or (ReplicatedStorage:FindFirstChild("RemoteEvents") and ReplicatedStorage.RemoteEvents:FindFirstChild(step.remoteName or "PlaceTower"))
@@ -814,6 +839,7 @@ task.spawn(function()
             if UserConfig.playMacro and not isPlaying and not isRecording and not hasPlayedThisMatch and #recordedActions > 0 then
                 hasPlayedThisMatch = true
                 hasTriggeredReplay = false
+                highestWaveReached = curW or 1
                 matchStartTime = os.time()
                 snapshotCurrencies()
                 print(string.format("[Auto Loop] 進入遊戲，立刻啟動 Macro「%s」！", currentMacroName))
@@ -868,8 +894,9 @@ task.spawn(function()
                 _G.Suite7414_Losses = _G.Suite7414_Losses + 1 
             end
 
-            print(string.format("[ATD 結算] 結果: %s (波次: %d/%d)，推送 Webhook！", isWin and "勝利" or "失敗", highestWaveReached, currentMatchMaxWave))
-            sendDiscordWebhook(isWin, highestWaveReached, false)
+            local finalWave = math.min(highestWaveReached, currentMatchMaxWave)
+            print(string.format("[ATD 結算] 結果: %s (波次: %d/%d)，推送 Webhook！", isWin and "勝利" or "失敗", finalWave, currentMatchMaxWave))
+            sendDiscordWebhook(isWin, finalWave, false)
 
             if UserConfig.autoReplay then
                 task.spawn(function()
@@ -1256,7 +1283,7 @@ playCtrl = createSwitch(pageMacro, "執行重播 (Play Macro)", "持久開啟，
     end
 end, 2)
 
-recordCtrl = createSwitch(pageMacro, "錄製操作 (Record Macro)", "開啟後放塔、升級與賣塔 (修復版)", false, function(st, ctrl)
+recordCtrl = createSwitch(pageMacro, "錄製操作 (Record Macro)", "開啟後放塔、升級與賣塔 (無雜訊)", false, function(st, ctrl)
     if isPlaying then
         ctrl.Set(false)
         return
@@ -1265,7 +1292,7 @@ recordCtrl = createSwitch(pageMacro, "錄製操作 (Record Macro)", "開啟後�
     if isRecording then
         recordedActions = {}
         lastActionTime = os.clock()
-        print(string.format("[ATD] 開始錄製至「%s」(升級無感秒錄)", currentMacroName))
+        print(string.format("[ATD] 開始錄製至「%s」", currentMacroName))
     else
         saveCurrentMacro()
         print(string.format("[ATD] 結束錄製，已存 %d 步動作", #recordedActions))
@@ -1282,7 +1309,7 @@ task.spawn(function()
             lastState = isRecording
             pcall(function()
                 if recordCtrl then
-                    recordCtrl.SetDesc(isRecording and string.format("● 錄製中... (已捕捉 %d 步動作)", #recordedActions) or "開啟後放塔、升級與賣塔 (修復版)")
+                    recordCtrl.SetDesc(isRecording and string.format("● 錄製中... (已捕捉 %d 步動作)", #recordedActions) or "開啟後放塔、升級與賣塔 (無雜訊)")
                 end
                 if playCtrl and not isPlaying and not UserConfig.playMacro then
                     playCtrl.SetDesc(string.format("檔案: %s (共 %d 步動作)", currentMacroName, #recordedActions))
@@ -1390,7 +1417,7 @@ Instance.new("UICorner", testBtn).CornerRadius = UDim.new(0, 5)
 
 testBtn.MouseButton1Click:Connect(function()
     print("[Webhook] 正在發送測試推播...")
-    sendDiscordWebhook(true, 20, true)
+    sendDiscordWebhook(true, 60, true)
 end)
 
 createSectionDivider(pageWebhook, "Notification", 4)
