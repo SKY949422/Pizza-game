@@ -1,6 +1,6 @@
 -- ========================================================
--- [ 7414 TD MACRO SUITE - Alliance Tower Defense 旗艦修復版 ]
--- 完美修正賣塔捕捉 (生前座標快取) + 10/10解卡 + Webhook + 自動重開
+-- [ 7414 TD MACRO SUITE - Alliance Tower Defense 終極修復版 ]
+-- 徹底修復升級報錯 (Namecall污染修復) + 極速重播 + Webhook戰報
 -- ========================================================
 
 if _G.Suite7414_NewGame_Running then
@@ -58,7 +58,7 @@ local isListeningKey = false
 local matchStartTime = os.time()
 local initialCurrencies = {}
 
--- 塔位動態座標快取 (防止賣塔瞬間被銷毀變成 nil 或 0,0,0)
+-- 塔位動態座標快取庫
 local towerPositionCache = {}
 local lastSelectedTower = nil
 local lastSelectedPos = nil
@@ -118,59 +118,34 @@ local function formatSessionTime(seconds)
 end
 
 -- --------------------------------------------------------
--- 2. 塔位快取與座標輔助 (徹底解決 GetNil 賣塔無效)
+-- 2. 塔位快取與安全座標提取 (完全杜絕 Namecall 衝突)
 -- --------------------------------------------------------
-local function getInstancePosition(inst)
+local function safeGetPosition(inst)
     if not inst or typeof(inst) ~= "Instance" then return nil end
     local pos = nil
     pcall(function()
         if inst:IsA("Model") then
-            if inst.PrimaryPart then
-                pos = inst.PrimaryPart.Position
+            local root = inst.PrimaryPart or inst:FindFirstChild("HumanoidRootPart") or inst:FindFirstChildWhichIsA("BasePart")
+            if root then
+                pos = root.Position
             else
-                local root = inst:FindFirstChild("HumanoidRootPart") 
-                    or inst:FindFirstChild("Torso") 
-                    or inst:FindFirstChild("UpperTorso") 
-                    or inst:FindFirstChildWhichIsA("BasePart", true)
-                if root then
-                    pos = root.Position
-                else
-                    pos = inst:GetPivot().Position
-                end
+                pos = inst:GetPivot().Position
             end
         elseif inst:IsA("BasePart") then
             pos = inst.Position
-        elseif inst:IsA("Folder") or inst:IsA("Configuration") then
-            local bp = inst:FindFirstChildWhichIsA("BasePart", true)
-            if bp then pos = bp.Position end
         end
     end)
-    -- 過濾無效 (0,0,0) 坐標
     if pos and pos.Magnitude < 1.0 then pos = nil end
     return pos
 end
 
--- 即時維護所有塔的生前座標
-local function cacheTowerInstance(t)
-    if not t or typeof(t) ~= "Instance" then return end
-    task.spawn(function()
-        for _ = 1, 5 do
-            local p = getInstancePosition(t)
-            if p then
-                towerPositionCache[t] = p
-                break
-            end
-            task.wait(0.1)
-        end
-    end)
-end
-
+-- 背景常駐刷新快取
 task.spawn(function()
     while _G.Suite7414_NewGame_Running do
         local towersFolder = workspace:FindFirstChild("Towers")
         if towersFolder then
             for _, t in ipairs(towersFolder:GetChildren()) do
-                local p = getInstancePosition(t)
+                local p = safeGetPosition(t)
                 if p then
                     towerPositionCache[t] = p
                 end
@@ -187,11 +162,11 @@ local function findNearestTower(targetPos, maxDist, preferredName)
 
     if towersFolder and targetPos then
         for _, child in ipairs(towersFolder:GetChildren()) do
-            local pos = getInstancePosition(child) or towerPositionCache[child]
+            local pos = safeGetPosition(child) or towerPositionCache[child]
             if pos then
                 local dist = (pos - targetPos).Magnitude
                 if preferredName and child.Name == preferredName then
-                    dist = dist * 0.8 -- 同名塔優先鎖定
+                    dist = dist * 0.8
                 end
                 if dist < minDistance then
                     minDistance = dist
@@ -562,7 +537,7 @@ local function deleteCurrentMacro()
 end
 
 -- --------------------------------------------------------
--- 6. Hook 動作捕捉 (含生前快取，百分之百捕獲賣塔)
+-- 6. Hook 動作捕捉 (★ 非同步無感攔截，徹底修復 Line 2913 報錯)
 -- --------------------------------------------------------
 local oldNamecall
 oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
@@ -570,10 +545,11 @@ oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
     local args = {...}
 
     if isRecording and not isPlaying and not checkcaller() then
-        if method == "InvokeServer" or method == "invokeServer" or method == "FireServer" or method == "fireServer" then
-            local rName = self and self.Name or ""
-            local lowerName = string.lower(rName)
+        local rName = self and self.Name or ""
+        local lowerName = string.lower(rName)
 
+        -- 將耗時與有 Colon Call 風險的操作丟入 task.spawn，主線程原樣通行
+        task.spawn(function()
             -- 1. 放塔捕捉
             if lowerName:find("place") or lowerName:find("spawn") or lowerName:find("summon") then
                 local targetCFrame = nil
@@ -603,15 +579,15 @@ oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
                     print(string.format("[ATD 捕捉] 放塔: %s (步數: %d)", tostring(targetTowerName), #recordedActions))
                 end
 
-            -- 2. 升級塔捕捉
+            -- 2. 升級塔捕捉 (安全非同步)
             elseif lowerName:find("upgradetower") or lowerName == "upgrade" then
                 local now = os.clock()
-                if (now - lastActionTime) > 0.2 then
+                if (now - lastActionTime) > 0.15 then
                     local delay = (#recordedActions == 0) and 0 or (now - lastActionTime)
                     lastActionTime = now
 
                     local inst = args[1]
-                    local pos = getInstancePosition(inst) or towerPositionCache[inst]
+                    local pos = safeGetPosition(inst) or towerPositionCache[inst] or lastSelectedPos
 
                     if inst and pos then
                         lastSelectedTower = inst
@@ -627,15 +603,14 @@ oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
                     print(string.format("[ATD 捕捉] 升級: %s (步數: %d)", tostring(inst and inst.Name), #recordedActions))
                 end
 
-            -- 3. ★ 賣塔捕捉 (徹底修復 GetNil 與銷毀遺失問題)
+            -- 3. 賣塔捕捉 (安全非同步)
             elseif lowerName:find("selltower") or lowerName == "sell" then
                 local now = os.clock()
                 local delay = (#recordedActions == 0) and 0 or (now - lastActionTime)
                 lastActionTime = now
 
                 local inst = args[1]
-                -- 順序檢索：實體位置 -> 歷史快取庫 -> 最後點選面板位置
-                local pos = getInstancePosition(inst) or towerPositionCache[inst] or lastSelectedPos
+                local pos = safeGetPosition(inst) or towerPositionCache[inst] or lastSelectedPos
                 local tName = (inst and inst.Name ~= "" and inst.Name) or (lastSelectedTower and lastSelectedTower.Name) or "Tower"
 
                 if pos then
@@ -645,19 +620,18 @@ oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
                         position = pos,
                         towerName = tName
                     })
-                    print(string.format("[ATD 捕捉] ★ 賣塔成功記錄: %s (座標: %.1f, %.1f, %.1f, 步數: %d)", 
-                        tostring(tName), pos.X, pos.Y, pos.Z, #recordedActions))
-                else
-                    warn("[ATD 警告] 賣塔時未能解析到座標，請確認點擊面板時塔仍在畫面上！")
+                    print(string.format("[ATD 捕捉] ★ 賣塔成功記錄: %s (步數: %d)", tostring(tName), #recordedActions))
                 end
             end
-        end
+        end)
     end
 
+    -- ★ 嚴格還原 Namecall 指令，防止遊戲底層通訊崩潰
+    setnamecallmethod(method)
     return oldNamecall(self, ...)
 end))
 
--- 監聽玩家在畫面上點選塔 (自動鎖定選取的目標座標)
+-- 監聽玩家在畫面上點選塔
 UserInputService.InputBegan:Connect(function(input, gpe)
     if not isRecording or gpe then return end
     if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
@@ -669,7 +643,7 @@ UserInputService.InputBegan:Connect(function(input, gpe)
                 local model = p:FindFirstAncestorWhichIsA("Model")
                 if model and model.Parent == towersFolder then
                     lastSelectedTower = model
-                    lastSelectedPos = getInstancePosition(model) or towerPositionCache[model]
+                    lastSelectedPos = safeGetPosition(model) or towerPositionCache[model]
                 end
             end
         end
@@ -702,7 +676,7 @@ runPlayMacro = function(st)
 
                 if not isPlaying or not _G.Suite7414_NewGame_Running or not UserConfig.playMacro then break end
 
-                -- 1. 放塔 (4秒超時保護防卡死)
+                -- 1. 放塔 (4秒超時防卡死)
                 if step.type == "Place" then
                     local rTarget = (ReplicatedStorage:FindFirstChild("RemoteFunctions") and ReplicatedStorage.RemoteFunctions:FindFirstChild(step.remoteName or "PlaceTower"))
                         or (ReplicatedStorage:FindFirstChild("RemoteEvents") and ReplicatedStorage.RemoteEvents:FindFirstChild(step.remoteName or "PlaceTower"))
@@ -714,7 +688,7 @@ runPlayMacro = function(st)
                             if isGameOver then break end
 
                             if os.clock() - startTime > 4.0 then
-                                print(string.format("[ATD 提示] (%d/%d) 放塔超時 (可能已達 10/10 塔上限)，跳過此步", i, #recordedActions))
+                                print(string.format("[ATD 提示] (%d/%d) 放塔超時，跳過此步", i, #recordedActions))
                                 break
                             end
 
@@ -773,7 +747,7 @@ runPlayMacro = function(st)
                         end
                     end
 
-                -- 3. ★ 販賣塔 (精確大範圍索敵 + 循環重試直至成功)
+                -- 3. 販賣塔
                 elseif step.type == "Sell" then
                     local sellFunc = (ReplicatedStorage:FindFirstChild("RemoteFunctions") and ReplicatedStorage.RemoteFunctions:FindFirstChild("SellTower"))
                         or (ReplicatedStorage:FindFirstChild("RemoteEvents") and ReplicatedStorage.RemoteEvents:FindFirstChild("SellTower"))
@@ -793,11 +767,10 @@ runPlayMacro = function(st)
                                         sellFunc:FireServer(target)
                                     end
                                 end)
-                                print(string.format("[ATD 賣塔成功] (%d/%d) %s (已釋放塔位)", i, #recordedActions, tostring(step.towerName)))
+                                print(string.format("[ATD 賣塔成功] (%d/%d) %s", i, #recordedActions, tostring(step.towerName)))
                                 task.wait(0.3)
                                 break
                             else
-                                -- 若 1.5 秒內未搜尋到目標塔，說明該塔可能已被售出或不存在
                                 if os.clock() - startTime > 1.5 then break end
                             end
                             task.wait(0.2)
@@ -1283,7 +1256,7 @@ playCtrl = createSwitch(pageMacro, "執行重播 (Play Macro)", "持久開啟，
     end
 end, 2)
 
-recordCtrl = createSwitch(pageMacro, "錄製操作 (Record Macro)", "開啟後放塔、升級與賣塔 (含生前快取)", false, function(st, ctrl)
+recordCtrl = createSwitch(pageMacro, "錄製操作 (Record Macro)", "開啟後放塔、升級與賣塔 (修復版)", false, function(st, ctrl)
     if isPlaying then
         ctrl.Set(false)
         return
@@ -1292,7 +1265,7 @@ recordCtrl = createSwitch(pageMacro, "錄製操作 (Record Macro)", "開啟後�
     if isRecording then
         recordedActions = {}
         lastActionTime = os.clock()
-        print(string.format("[ATD] 開始錄製至「%s」(支援放塔/升級/賣塔)", currentMacroName))
+        print(string.format("[ATD] 開始錄製至「%s」(升級無感秒錄)", currentMacroName))
     else
         saveCurrentMacro()
         print(string.format("[ATD] 結束錄製，已存 %d 步動作", #recordedActions))
@@ -1309,7 +1282,7 @@ task.spawn(function()
             lastState = isRecording
             pcall(function()
                 if recordCtrl then
-                    recordCtrl.SetDesc(isRecording and string.format("● 錄製中... (已捕捉 %d 步動作)", #recordedActions) or "開啟後放塔、升級與賣塔 (含生前快取)")
+                    recordCtrl.SetDesc(isRecording and string.format("● 錄製中... (已捕捉 %d 步動作)", #recordedActions) or "開啟後放塔、升級與賣塔 (修復版)")
                 end
                 if playCtrl and not isPlaying and not UserConfig.playMacro then
                     playCtrl.SetDesc(string.format("檔案: %s (共 %d 步動作)", currentMacroName, #recordedActions))
