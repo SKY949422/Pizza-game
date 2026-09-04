@@ -1,6 +1,6 @@
 -- ========================================================
 -- [ 7414 TD MACRO SUITE - Alliance Tower Defense 終極修復版 ]
--- 徹底修復放塔誤判與步驟狂跳 + 全新塔實體比對 + Webhook 戰報
+-- 滿級防卡死跳過 + 等錢狀態回報 + 10/10滿位防呆 + Webhook 戰報
 -- ========================================================
 
 if _G.Suite7414_NewGame_Running then
@@ -155,9 +155,9 @@ task.spawn(function()
     end
 end)
 
-local function findNearestTower(targetPos, maxDist, preferredName)
+local function findNearestTower(targetPos, maxDist)
     local bestTower = nil
-    local minDistance = maxDist or 8
+    local minDistance = maxDist or 12
     local towersFolder = workspace:FindFirstChild("Towers")
 
     if towersFolder and targetPos then
@@ -165,9 +165,6 @@ local function findNearestTower(targetPos, maxDist, preferredName)
             local pos = safeGetPosition(child) or towerPositionCache[child]
             if pos then
                 local dist = (pos - targetPos).Magnitude
-                if preferredName and child.Name == preferredName then
-                    dist = dist * 0.8
-                end
                 if dist < minDistance then
                     minDistance = dist
                     bestTower = child
@@ -176,6 +173,33 @@ local function findNearestTower(targetPos, maxDist, preferredName)
         end
     end
     return bestTower
+end
+
+-- 獲取對局當前放塔金錢 (Cash)
+local function getMatchCash()
+    local cash = 0
+    pcall(function()
+        local ls = LocalPlayer:FindFirstChild("leaderstats")
+        if ls then
+            local c = ls:FindFirstChild("Cash") or ls:FindFirstChild("Money")
+            if c and typeof(c.Value) == "number" then cash = c.Value end
+        end
+        if cash == 0 then
+            local pgui = LocalPlayer:FindFirstChild("PlayerGui")
+            if pgui then
+                for _, lbl in ipairs(pgui:GetDescendants()) do
+                    if lbl:IsA("TextLabel") and lbl.Visible and lbl.Text then
+                        local m = lbl.Text:match("^%s*(%d+[,%d]*)%s*$")
+                        if m then
+                            local num = tonumber((m:gsub(",", "")))
+                            if num and num > cash and num < 10000000 then cash = num end
+                        end
+                    end
+                end
+            end
+        end
+    end)
+    return cash
 end
 
 -- --------------------------------------------------------
@@ -667,7 +691,7 @@ UserInputService.InputBegan:Connect(function(input, gpe)
 end)
 
 -- --------------------------------------------------------
--- 7. 巨集重播核心 (全新塔實體比對，徹底杜絕步驟狂跳)
+-- 7. 巨集重播核心 (升級滿級防卡死 + 即時等錢回報)
 -- --------------------------------------------------------
 runPlayMacro = function(st)
     if isRecording then return end
@@ -692,30 +716,29 @@ runPlayMacro = function(st)
 
                 if not isPlaying or not _G.Suite7414_NewGame_Running or not UserConfig.playMacro then break end
 
-                -- 1. 放塔 (★ 全新實體比對，絕不誤判舊塔)
+                -- 1. 放塔
                 if step.type == "Place" then
                     local rTarget = (ReplicatedStorage:FindFirstChild("RemoteFunctions") and ReplicatedStorage.RemoteFunctions:FindFirstChild(step.remoteName or "PlaceTower"))
                         or (ReplicatedStorage:FindFirstChild("RemoteEvents") and ReplicatedStorage.RemoteEvents:FindFirstChild(step.remoteName or "PlaceTower"))
 
                     if rTarget then
+                        local startTime = os.clock()
+                        local lastNotifyTime = 0
+
                         while isPlaying and _G.Suite7414_NewGame_Running and UserConfig.playMacro do
                             if checkGameResult() then break end
 
                             local currentTowers = workspace:FindFirstChild("Towers")
                             local currentCount = currentTowers and #currentTowers:GetChildren() or 0
 
-                            -- 只有在真正達到 10/10 滿載時才跳過
                             if currentCount >= 10 then
                                 print(string.format("[ATD 提示] (%d/%d) 塔位已滿 10/10，跳過此放塔步驟", i, #recordedActions))
                                 break
                             end
 
-                            -- 截圖當前場上現存的所有塔
                             local beforeTowers = {}
                             if currentTowers then
-                                for _, t in ipairs(currentTowers:GetChildren()) do
-                                    beforeTowers[t] = true
-                                end
+                                for _, t in ipairs(currentTowers:GetChildren()) do beforeTowers[t] = true end
                             end
 
                             local res = nil
@@ -729,7 +752,6 @@ runPlayMacro = function(st)
 
                             task.wait(0.2)
 
-                            -- 檢測場上是否真正多出一隻「全新的塔」
                             local newlyCreated = false
                             if currentTowers then
                                 for _, t in ipairs(currentTowers:GetChildren()) do
@@ -742,29 +764,49 @@ runPlayMacro = function(st)
                                 end
                             end
 
-                            -- 成功放下了全新的塔
                             if newlyCreated or (res ~= false and res ~= nil and res ~= 0) then
                                 print(string.format("[ATD 放塔成功] (%d/%d) %s", i, #recordedActions, tostring(step.towerName)))
                                 task.wait(0.2)
                                 break
                             end
 
-                            -- 錢還不夠，正常輪詢等錢，絕不隨便跳過
+                            -- 每 3 秒印出等錢日誌反饋
+                            if os.clock() - lastNotifyTime >= 3.0 then
+                                lastNotifyTime = os.clock()
+                                local curCash = getMatchCash()
+                                print(string.format("[ATD 放塔等待] (%d/%d) 等待金幣放塔 %s (目前金幣: %d, 已等待 %.0fs)", 
+                                    i, #recordedActions, tostring(step.towerName), curCash, os.clock() - startTime))
+                                if playCtrl then
+                                    playCtrl.SetDesc(string.format("▶ 等錢放塔 (%d/%d) 錢:%d...", i, #recordedActions, curCash))
+                                end
+                            end
+
                             task.wait(0.35)
                         end
                     end
 
-                -- 2. 升級塔 (等錢秒升)
+                -- 2. 升級塔 (★ 滿級防卡死 + 智能跳過)
                 elseif step.type == "Upgrade" then
                     local upgradeFunc = (ReplicatedStorage:FindFirstChild("RemoteFunctions") and ReplicatedStorage.RemoteFunctions:FindFirstChild("UpgradeTower"))
                         or (ReplicatedStorage:FindFirstChild("RemoteEvents") and ReplicatedStorage.RemoteEvents:FindFirstChild("UpgradeTower"))
 
                     if upgradeFunc and step.position then
+                        local startTime = os.clock()
+                        local lastNotifyTime = 0
+                        local attemptCount = 0
+
                         while isPlaying and _G.Suite7414_NewGame_Running and UserConfig.playMacro do
                             if checkGameResult() then break end
 
-                            local target = findNearestTower(step.position, 6, step.towerName)
-                            if target then
+                            -- 放大至 12 studs 鎖定塔
+                            local target = findNearestTower(step.position, 12)
+                            if not target then
+                                if os.clock() - startTime > 3.0 then
+                                    print(string.format("[ATD 提示] (%d/%d) 找不到目標塔，跳過此升級", i, #recordedActions))
+                                    break
+                                end
+                            else
+                                attemptCount = attemptCount + 1
                                 local res = nil
                                 pcall(function()
                                     if upgradeFunc.ClassName == "RemoteFunction" then
@@ -775,11 +817,53 @@ runPlayMacro = function(st)
                                     end
                                 end)
 
-                                -- 升級成功才邁向下一個步驟
-                                if res ~= false and res ~= nil then
+                                -- 升級成功
+                                if res ~= false and res ~= nil and res ~= 0 then
                                     print(string.format("[ATD 升級成功] (%d/%d) %s", i, #recordedActions, tostring(step.towerName)))
                                     task.wait(0.2)
                                     break
+                                end
+
+                                -- 伺服器回傳滿級關鍵字
+                                if typeof(res) == "string" and (res:lower():find("max") or res:lower():find("full") or res:lower():find("limit")) then
+                                    print(string.format("[ATD 提示] (%d/%d) %s 已達最高等級(Max)，自動跳過！", i, #recordedActions, tostring(step.towerName)))
+                                    break
+                                end
+
+                                -- 滿級標籤檢測
+                                local isMax = false
+                                pcall(function()
+                                    if target:GetAttribute("Max") or target:GetAttribute("IsMax") then isMax = true end
+                                    local lv = target:FindFirstChild("Level") or target:FindFirstChild("Upgrade")
+                                    local maxLv = target:FindFirstChild("MaxLevel")
+                                    if lv and maxLv and lv.Value >= maxLv.Value then isMax = true end
+                                end)
+                                if isMax then
+                                    print(string.format("[ATD 提示] (%d/%d) %s 檢測已滿級，跳過！", i, #recordedActions, tostring(step.towerName)))
+                                    break
+                                end
+
+                                -- 金幣充足卻多次失敗 -> 判定為已滿級防卡死
+                                local curCash = getMatchCash()
+                                if curCash >= 3000 and attemptCount >= 6 then
+                                    print(string.format("[ATD 提示] (%d/%d) 金幣充足(%d)仍無法升級，判定為已滿級，跳過！", i, #recordedActions, curCash))
+                                    break
+                                end
+
+                                -- 超過 20 秒仍無法升級 -> 強制跳過防卡死整局
+                                if os.clock() - startTime > 20.0 then
+                                    print(string.format("[ATD 超時] (%d/%d) 升級超時 20 秒，自動前進下一步！", i, #recordedActions))
+                                    break
+                                end
+
+                                -- 每 3 秒回報狀態
+                                if os.clock() - lastNotifyTime >= 3.0 then
+                                    lastNotifyTime = os.clock()
+                                    print(string.format("[ATD 升級等待] (%d/%d) 等待金幣升級 %s (金幣: %d, 已等待 %.0fs)", 
+                                        i, #recordedActions, tostring(step.towerName), curCash, os.clock() - startTime))
+                                    if playCtrl then
+                                        playCtrl.SetDesc(string.format("▶ 等錢升級 (%d/%d) 錢:%d...", i, #recordedActions, curCash))
+                                    end
                                 end
                             end
                             task.wait(0.35)
@@ -796,7 +880,7 @@ runPlayMacro = function(st)
                         while isPlaying and _G.Suite7414_NewGame_Running and UserConfig.playMacro do
                             if checkGameResult() then break end
 
-                            local target = findNearestTower(step.position, 8, step.towerName)
+                            local target = findNearestTower(step.position, 12)
                             if target then
                                 pcall(function()
                                     if sellFunc.ClassName == "RemoteFunction" then
