@@ -1,6 +1,6 @@
 -- ========================================================
--- [ 7414 TD MACRO SUITE - Alliance Tower Defense 終極版 ]
--- 開關永久存檔 + 自動記憶檔案 + 進圖自動重播 (Auto Play)
+-- [ 7414 TD MACRO SUITE - Alliance Tower Defense 旗艦版 ]
+-- Macro + Automation + Webhook 戰報 + 偏好設定 (粉色主題)
 -- ========================================================
 
 if _G.Suite7414_NewGame_Running then
@@ -17,23 +17,38 @@ local HttpService = game:GetService("HttpService")
 
 local LocalPlayer = Players.LocalPlayer
 
+-- Session 統計持久化
+_G.Suite7414_SessionStart = _G.Suite7414_SessionStart or os.time()
+_G.Suite7414_MatchesPlayed = _G.Suite7414_MatchesPlayed or 0
+_G.Suite7414_Wins = _G.Suite7414_Wins or 0
+_G.Suite7414_Losses = _G.Suite7414_Losses or 0
+
 -- 獨立存檔目錄
 local FOLDER_NAME = "alliance tower defense"
 local CONFIG_FILE_PATH = FOLDER_NAME .. "/config.json"
 local currentMacroName = "Default"
 local macroList = {}
 
--- 全域持久化設定 (開關預設值會被 config.json 覆蓋)
+-- 全域持久化設定 (粉色主題: 255, 105, 180)
 local UserConfig = {
     currentMacro = "Default",
+    difficulty = "Normal",
     autoPlayMacro = true,
     autoReplay = true,
     autoSkip = true,
-    smartFastMode = true,
     toggleKey = "RightControl",
     mobileToggle = true,
     uiColor = "255, 105, 180",
-    macroScale = 1.0
+    bgImageId = "",
+    macroScale = 1.0,
+    
+    -- Webhook 配置
+    webhookUrl = "",
+    mentionId = "",
+    notifyStageFinished = true,
+    notifySessionData = true,
+    onlyMentionRare = false,
+    webhookHideName = false
 }
 
 local isRecording = false
@@ -41,9 +56,11 @@ local isPlaying = false
 local recordedActions = {}
 local lastActionTime = 0
 local isListeningKey = false
+local matchStartTime = os.time()
+local initialCurrencies = {}
 
 local runPlayMacro, playCtrl, recordCtrl
-local applyCustomTheme, mainFrameRef
+local applyCustomTheme, bgImageLabel, mainFrameRef
 
 -- --------------------------------------------------------
 -- 1. 檔案與持久化配置管理
@@ -71,9 +88,7 @@ local function loadUserConfig()
         if ok and content then
             local decodeOk, data = pcall(function() return HttpService:JSONDecode(content) end)
             if decodeOk and typeof(data) == "table" then
-                for k, v in pairs(data) do 
-                    UserConfig[k] = v 
-                end
+                for k, v in pairs(data) do UserConfig[k] = v end
                 currentMacroName = UserConfig.currentMacro or "Default"
             end
         end
@@ -81,8 +96,21 @@ local function loadUserConfig()
 end
 loadUserConfig()
 
+local function formatTime(seconds)
+    local mins = math.floor(seconds / 60)
+    local secs = seconds % 60
+    return string.format("%d:%02d", mins, secs)
+end
+
+local function formatSessionTime(seconds)
+    local hours = math.floor(seconds / 3600)
+    local mins = math.floor((seconds % 3600) / 60)
+    local secs = seconds % 60
+    return hours > 0 and string.format("%d:%02d:%02d", hours, mins, secs) or string.format("%d:%02d", mins, secs)
+end
+
 -- --------------------------------------------------------
--- 2. 座標與波次輔助函式
+-- 2. 座標、波次與 Webhook 戰報核心
 -- --------------------------------------------------------
 local function getInstancePosition(inst)
     if not inst or typeof(inst) ~= "Instance" then return nil end
@@ -134,15 +162,127 @@ local function getCurrentWave()
         for _, obj in ipairs(playerGui:GetDescendants()) do
             if obj:IsA("TextLabel") and obj.Visible then
                 local wMatch = obj.Text:match("[Ww]ave%s*(%d+)%s*/") or obj.Text:match("[Ww]ave%s*[:%-]?%s*(%d+)")
-                if wMatch then
-                    return tonumber(wMatch)
-                end
+                if wMatch then return tonumber(wMatch) end
             end
         end
     end
     return nil
 end
 
+local trackedCurrencies = {"Coins", "Gems", "Gold", "Tokens", "Cash", "Exp", "Experience"}
+
+local function snapshotCurrencies()
+    initialCurrencies = {}
+    local function recordVal(name, val)
+        local lower = string.lower(name)
+        if lower ~= "money" and lower ~= "matchcash" then
+            if initialCurrencies[name] == nil then initialCurrencies[name] = val end
+        end
+    end
+
+    local function scan(container)
+        if not container then return end
+        for _, child in ipairs(container:GetChildren()) do
+            if child:IsA("ValueBase") then recordVal(child.Name, child.Value) end
+        end
+    end
+
+    scan(LocalPlayer:FindFirstChild("leaderstats"))
+    scan(LocalPlayer:FindFirstChild("Currencies"))
+    for _, name in ipairs(trackedCurrencies) do
+        local obj = LocalPlayer:FindFirstChild(name)
+        if obj and obj:IsA("ValueBase") then recordVal(name, obj.Value) end
+    end
+end
+
+local function sendDiscordWebhook(isVictory, wavesBeaten, isTest)
+    if not UserConfig.notifyStageFinished or UserConfig.webhookUrl:gsub("%s+", "") == "" then return end
+
+    local httpRequest = (syn and syn.request) or (http and http.request) or http_request or (fluxus and fluxus.request) or request
+    if not httpRequest then return end
+
+    local matchDuration = os.time() - matchStartTime
+    local sessionDuration = os.time() - _G.Suite7414_SessionStart
+    local mapName = (workspace:FindFirstChild("Map") and workspace.Map:FindFirstChildOfClass("Model") and workspace.Map:FindFirstChildOfClass("Model").Name) or "ATD Arena"
+
+    local rewardsList = {}
+    local isRareDrop = false
+
+    local function scanForDeltas(container)
+        if not container then return end
+        for _, child in ipairs(container:GetChildren()) do
+            if child:IsA("ValueBase") and typeof(child.Value) == "number" then
+                local init = initialCurrencies[child.Name] or child.Value
+                local delta = child.Value - init
+                if delta > 0 then
+                    table.insert(rewardsList, string.format("• %s: +%s (%s)", child.Name, tostring(delta), tostring(child.Value)))
+                    if child.Name:lower():find("gem") or child.Name:lower():find("token") then
+                        isRareDrop = true
+                    end
+                end
+            end
+        end
+    end
+
+    scanForDeltas(LocalPlayer:FindFirstChild("leaderstats"))
+    scanForDeltas(LocalPlayer:FindFirstChild("Currencies"))
+
+    if isTest and #rewardsList == 0 then
+        table.insert(rewardsList, "• Coins: +500 (1500)")
+        table.insert(rewardsList, "• Gems: +50 (120)")
+    end
+
+    local rewardsText = #rewardsList > 0 and table.concat(rewardsList, "\n") or "• 通關獎勵結算中"
+    local playerName = UserConfig.webhookHideName and ("||" .. LocalPlayer.Name .. "||") or LocalPlayer.Name
+
+    local fieldsList = {
+        { name = "玩家", value = playerName, inline = true },
+        { name = "波次進度", value = string.format("Wave %s", tostring(wavesBeaten or 20)), inline = true },
+        { name = "戰鬥狀態", value = string.format("結果: %s\n地圖: %s\n耗時: %s", isVictory and "勝利 (Victory)" or "失敗 (Defeat)", mapName, formatTime(matchDuration)), inline = false },
+        { name = "獲得獎勵", value = rewardsText, inline = false }
+    }
+
+    if UserConfig.notifySessionData then
+        table.insert(fieldsList, {
+            name = "Session 統計",
+            value = string.format("累計時間: %s\n累計場次: %d (勝/負: %d/%d)", formatSessionTime(sessionDuration), _G.Suite7414_MatchesPlayed, _G.Suite7414_Wins, _G.Suite7414_Losses),
+            inline = false
+        })
+    end
+
+    local mentionContent = ""
+    if UserConfig.mentionId:gsub("%s+", "") ~= "" then
+        local rawId = UserConfig.mentionId:gsub("[^%d]", "")
+        if rawId ~= "" and (not UserConfig.onlyMentionRare or isRareDrop) then
+            mentionContent = "<@" .. rawId .. ">"
+        end
+    end
+
+    local embed = {
+        title = "Alliance Tower Defense 戰報",
+        color = isVictory and 16738740 or 15158332,
+        fields = fieldsList,
+        footer = { text = "7414 TD Suite • " .. os.date("%Y/%m/%d %X") }
+    }
+
+    pcall(function()
+        httpRequest({
+            Url = UserConfig.webhookUrl,
+            Method = "POST",
+            Headers = {["Content-Type"] = "application/json"},
+            Body = HttpService:JSONEncode({
+                content = mentionContent ~= "" and mentionContent or nil,
+                username = "7414 ATD Notifier",
+                avatar_url = "https://i.imgur.com/8QpZ5n7.png",
+                embeds = {embed}
+            })
+        })
+    end)
+end
+
+-- --------------------------------------------------------
+-- 3. 巨集檔案序列化
+-- --------------------------------------------------------
 local function serializeActions(actions)
     local serialized = {}
     for _, step in ipairs(actions) do
@@ -240,7 +380,7 @@ local function deleteCurrentMacro()
 end
 
 -- --------------------------------------------------------
--- 3. Hook 動作捕捉 (PlaceTower / UpgradeTower / SellTower)
+-- 4. Hook 動作捕捉 (PlaceTower / UpgradeTower / SellTower)
 -- --------------------------------------------------------
 local oldNamecall
 oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
@@ -302,7 +442,7 @@ oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
 end))
 
 -- --------------------------------------------------------
--- 4. 自動守護線程 (進圖自動重播 + 跳波 + 重開)
+-- 5. 自動守護線程 (Auto Play + Auto Skip + Auto Replay + Webhook)
 -- --------------------------------------------------------
 task.spawn(function()
     task.wait(1.5)
@@ -310,6 +450,7 @@ task.spawn(function()
     local hasAutoPlayedThisMatch = false
     local lastVotedNextWave = -1
     local lastVoteTime = 0
+    snapshotCurrencies()
 
     while _G.Suite7414_NewGame_Running do
         task.wait(0.5)
@@ -317,17 +458,22 @@ task.spawn(function()
         local currentWave = getCurrentWave()
         local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
         local isGameOver = false
+        local isWin = false
 
         if playerGui then
             for _, gui in ipairs(playerGui:GetChildren()) do
                 if gui:IsA("ScreenGui") and gui.Enabled then
+                    local victoryFrame = gui:FindFirstChild("Victory", true)
                     local endFrame = gui:FindFirstChild("EndScreen", true) 
-                        or gui:FindFirstChild("Victory", true) 
                         or gui:FindFirstChild("GameOver", true)
                         or gui:FindFirstChild("Replay", true)
                         or gui:FindFirstChild("ReplayVote", true)
 
-                    if endFrame and (endFrame:IsA("GuiObject") and endFrame.Visible) then
+                    if victoryFrame and (victoryFrame:IsA("GuiObject") and victoryFrame.Visible) then
+                        isGameOver = true
+                        isWin = true
+                        break
+                    elseif endFrame and (endFrame:IsA("GuiObject") and endFrame.Visible) then
                         isGameOver = true
                         break
                     end
@@ -335,15 +481,17 @@ task.spawn(function()
             end
         end
 
-        -- 1. 進圖 / 開局自動重播 (Auto Play Macro)
+        -- 1. 進圖自動重播
         if currentWave and currentWave >= 1 and not isGameOver then
             if not hasAutoPlayedThisMatch then
                 hasAutoPlayedThisMatch = true
                 hasTriggeredReplay = false
+                matchStartTime = os.time()
+                snapshotCurrencies()
 
                 if UserConfig.autoPlayMacro and #recordedActions > 0 and not isPlaying and not isRecording then
                     task.spawn(function()
-                        task.wait(2.5) -- 等候場景與金幣就緒
+                        task.wait(2.5)
                         if not _G.Suite7414_NewGame_Running or isPlaying or isRecording then return end
                         print(string.format("[Auto Play] 偵測到開局，自動啟動 Macro「%s」", currentMacroName))
                         if runPlayMacro then runPlayMacro(true) end
@@ -354,7 +502,7 @@ task.spawn(function()
             hasAutoPlayedThisMatch = false
         end
 
-        -- 2. 自動跳波 (Auto Skip: 傳送 NextWave = currentWave + 1)
+        -- 2. 自動跳波 (SkipWaveVote: currentWave + 1)
         if UserConfig.autoSkip and not isGameOver then
             if currentWave then
                 local targetNextWave = currentWave + 1
@@ -366,9 +514,7 @@ task.spawn(function()
 
                     pcall(function()
                         local skipEvent = ReplicatedStorage:FindFirstChild("RemoteEvents") and ReplicatedStorage.RemoteEvents:FindFirstChild("SkipWaveVote")
-                        if skipEvent then
-                            skipEvent:FireServer(targetNextWave)
-                        end
+                        if skipEvent then skipEvent:FireServer(targetNextWave) end
                     end)
 
                     if playerGui then
@@ -392,35 +538,34 @@ task.spawn(function()
             end
         end
 
-        -- 3. 自動重開 (Auto Replay)
-        if UserConfig.autoReplay then
-            if isGameOver and not hasTriggeredReplay then
-                hasTriggeredReplay = true
-                print("[Auto Replay] 偵測到結算畫面，發送 ReplayVote 投票重開！")
+        -- 3. 自動重開與 Webhook 結算推播
+        if isGameOver and not hasTriggeredReplay then
+            hasTriggeredReplay = true
+            _G.Suite7414_MatchesPlayed = _G.Suite7414_MatchesPlayed + 1
+            if isWin then _G.Suite7414_Wins = _G.Suite7414_Wins + 1 else _G.Suite7414_Losses = _G.Suite7414_Losses + 1 end
 
+            sendDiscordWebhook(isWin, currentWave, false)
+
+            if UserConfig.autoReplay then
                 task.spawn(function()
                     for attempt = 1, 6 do
                         if not _G.Suite7414_NewGame_Running then break end
-
                         pcall(function()
                             local replayEvent = ReplicatedStorage:FindFirstChild("RemoteEvents") and ReplicatedStorage.RemoteEvents:FindFirstChild("ReplayVote")
-                            if replayEvent then
-                                replayEvent:FireServer()
-                            end
+                            if replayEvent then replayEvent:FireServer() end
                         end)
-
                         task.wait(0.8)
                     end
                 end)
-            elseif not isGameOver then
-                hasTriggeredReplay = false
             end
+        elseif not isGameOver then
+            hasTriggeredReplay = false
         end
     end
 end)
 
 -- --------------------------------------------------------
--- 5. 巨集重播核心 (等錢秒放 + 等錢秒升 + 精準賣塔)
+-- 6. 巨集重播核心 (流暢原生節奏 + 等錢秒放 + 等錢秒升)
 -- --------------------------------------------------------
 runPlayMacro = function(st)
     if isRecording then
@@ -447,7 +592,7 @@ runPlayMacro = function(st)
                 end
 
                 if step.delay > 0 then
-                    local targetWait = UserConfig.smartFastMode and math.clamp(step.delay * 0.1, 0.15, 1.0) or (step.delay * UserConfig.macroScale)
+                    local targetWait = step.delay * (UserConfig.macroScale or 1.0)
                     local waited = 0
                     while waited < targetWait and isPlaying and _G.Suite7414_NewGame_Running do
                         task.wait(0.05)
@@ -538,7 +683,7 @@ runPlayMacro = function(st)
 end
 
 -- --------------------------------------------------------
--- 6. UI 介面構建 (粉色主題版)
+-- 7. UI 介面構建 (粉色主題 4 分頁)
 -- --------------------------------------------------------
 local parentGui = (gethui and gethui()) or CoreGui:FindFirstChild("RobloxGui") or LocalPlayer:WaitForChild("PlayerGui")
 if parentGui:FindFirstChild("Suite7414UI") then
@@ -564,6 +709,14 @@ Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 10)
 local mainStroke = Instance.new("UIStroke", mainFrame)
 mainStroke.Color = Color3.fromRGB(35, 40, 48)
 mainStroke.Thickness = 1.2
+
+bgImageLabel = Instance.new("ImageLabel")
+bgImageLabel.Size = UDim2.new(1, 0, 1, 0)
+bgImageLabel.BackgroundTransparency = 1
+bgImageLabel.ScaleType = Enum.ScaleType.Slice
+bgImageLabel.ZIndex = 0
+bgImageLabel.Parent = mainFrame
+Instance.new("UICorner", bgImageLabel).CornerRadius = UDim.new(0, 10)
 
 local sidebar = Instance.new("Frame")
 sidebar.Size = UDim2.new(0, 160, 1, 0)
@@ -628,6 +781,60 @@ end
 
 local pageMacro = createPage("Macro")
 local pageAutomation = createPage("Automation")
+local pageWebhook = createPage("Webhook")
+local pageSettings = createPage("Settings")
+
+local accentElements = {}
+local function registerAccent(element)
+    table.insert(accentElements, element)
+end
+
+applyCustomTheme = function()
+    local r, g, b = UserConfig.uiColor:match("(%d+),%s*(%d+),%s*(%d+)")
+    local targetColor = (r and g and b) and Color3.fromRGB(tonumber(r), tonumber(g), tonumber(b)) or Color3.fromRGB(255, 105, 180)
+
+    brandBadge.BackgroundColor3 = targetColor
+    for _, el in ipairs(accentElements) do
+        if el and el.Parent then
+            if el:IsA("UIStroke") then
+                el.Color = targetColor
+            elseif el:IsA("TextButton") then
+                el.TextColor3 = targetColor
+            else
+                el.BackgroundColor3 = targetColor
+            end
+        end
+    end
+
+    if UserConfig.bgImageId and UserConfig.bgImageId ~= "" then
+        local idNum = UserConfig.bgImageId:match("%d+")
+        bgImageLabel.Image = idNum and ("rbxassetid://" .. idNum) or UserConfig.bgImageId
+        bgImageLabel.ImageTransparency = 0.25
+    else
+        bgImageLabel.Image = ""
+    end
+end
+
+local function createSectionDivider(parent, title, order)
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(1, -6, 0, 22)
+    frame.BackgroundTransparency = 1
+    frame.LayoutOrder = order or 0
+    frame.ZIndex = 2
+    frame.Parent = parent
+
+    local lbl = Instance.new("TextLabel")
+    lbl.Size = UDim2.new(1, 0, 1, 0)
+    lbl.BackgroundTransparency = 1
+    lbl.Text = "- " .. title .. " -"
+    lbl.TextColor3 = Color3.fromRGB(255, 170, 60)
+    lbl.TextSize = 12
+    lbl.Font = Enum.Font.SourceSansBold
+    lbl.TextXAlignment = Enum.TextXAlignment.Left
+    lbl.ZIndex = 2
+    lbl.Parent = frame
+    return frame
+end
 
 local function createBlock(parent, title, height, order)
     local frame = Instance.new("Frame")
@@ -705,6 +912,8 @@ local function createSwitch(parent, title, desc, defaultVal, callback, order)
     switchBox.Parent = btn
     Instance.new("UICorner", switchBox).CornerRadius = UDim.new(0, 10)
 
+    if defaultVal then registerAccent(switchBox) end
+
     local switchLabel = Instance.new("TextLabel")
     switchLabel.Size = UDim2.new(1, 0, 1, 0)
     switchLabel.BackgroundTransparency = 1
@@ -719,8 +928,17 @@ local function createSwitch(parent, title, desc, defaultVal, callback, order)
     local ctrl = {}
     function ctrl.Set(v)
         state = v
-        switchBox.BackgroundColor3 = state and Color3.fromRGB(255, 105, 180) or Color3.fromRGB(35, 40, 48)
-        switchLabel.TextColor3 = state and Color3.fromRGB(10, 25, 15) or Color3.fromRGB(150, 155, 165)
+        local r, g, b = UserConfig.uiColor:match("(%d+),%s*(%d+),%s*(%d+)")
+        local targetColor = (r and g and b) and Color3.fromRGB(tonumber(r), tonumber(g), tonumber(b)) or Color3.fromRGB(255, 105, 180)
+
+        if state then
+            switchBox.BackgroundColor3 = targetColor
+            switchLabel.TextColor3 = Color3.fromRGB(10, 25, 15)
+            registerAccent(switchBox)
+        else
+            switchBox.BackgroundColor3 = Color3.fromRGB(35, 40, 48)
+            switchLabel.TextColor3 = Color3.fromRGB(150, 155, 165)
+        end
         switchLabel.Text = state and "ON" or "OFF"
     end
     function ctrl.SetDesc(newDesc)
@@ -798,6 +1016,7 @@ updateMacroListView = function()
         btn.Font = Enum.Font.SourceSansBold
         btn.ZIndex = 2
         btn.Parent = macroScroll
+        if isCur then registerAccent(btn) end
         Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 4)
 
         btn.MouseButton1Click:Connect(function()
@@ -822,16 +1041,10 @@ playCtrl = createSwitch(pageMacro, "執行重播 (Play Macro)", "手動單次執
     runPlayMacro(st)
 end, 2)
 
--- ★ 進圖自動重播開關 (永久保存)
 createSwitch(pageMacro, "進圖自動重播 (Auto Play Macro)", "重開或進圖後，開局自動啟動重播", UserConfig.autoPlayMacro, function(st)
     UserConfig.autoPlayMacro = st
     saveUserConfig()
 end, 3)
-
-createSwitch(pageMacro, "智慧節奏壓縮 (Smart Fast Mode)", "大幅縮減無效等待，等錢自動秒放與秒升", UserConfig.smartFastMode, function(st)
-    UserConfig.smartFastMode = st
-    saveUserConfig()
-end, 4)
 
 recordCtrl = createSwitch(pageMacro, "錄製操作 (Record Macro)", "開啟後於遊戲中放塔、升級與賣塔", false, function(st, ctrl)
     if isPlaying then
@@ -847,7 +1060,7 @@ recordCtrl = createSwitch(pageMacro, "錄製操作 (Record Macro)", "開啟後�
         saveCurrentMacro()
         print(string.format("[ATD] 結束錄製，已存 %d 步動作", #recordedActions))
     end
-end, 5)
+end, 4)
 
 task.spawn(function()
     local lastCount = -1
@@ -880,10 +1093,220 @@ createSwitch(pageAutomation, "自動重開/投票 (Auto Replay)", "結算出現�
     saveUserConfig()
 end, 2)
 
--- 側邊導航
+-- ==================== 3. Webhook 戰報頁面 ====================
+createSectionDivider(pageWebhook, "Setting", 1)
+
+local webhookCard = createBlock(pageWebhook, "", 136, 2)
+
+local wTitle = Instance.new("TextLabel")
+wTitle.Size = UDim2.new(1, -20, 0, 16)
+wTitle.Position = UDim2.new(0, 10, 0, 6)
+wTitle.BackgroundTransparency = 1
+wTitle.Text = "Webhook URL"
+wTitle.TextColor3 = Color3.fromRGB(225, 230, 240)
+wTitle.TextSize = 12
+wTitle.Font = Enum.Font.SourceSansBold
+wTitle.TextXAlignment = Enum.TextXAlignment.Left
+wTitle.ZIndex = 2
+wTitle.Parent = webhookCard
+
+local webhookInput = Instance.new("TextBox")
+webhookInput.Size = UDim2.new(1, -20, 0, 26)
+webhookInput.Position = UDim2.new(0, 10, 0, 28)
+webhookInput.BackgroundColor3 = Color3.fromRGB(12, 14, 18)
+webhookInput.PlaceholderText = "https://discord.com/api/webhooks/..."
+webhookInput.Text = UserConfig.webhookUrl
+webhookInput.TextColor3 = Color3.fromRGB(240, 240, 245)
+webhookInput.TextSize = 11
+webhookInput.Font = Enum.Font.SourceSans
+webhookInput.ZIndex = 2
+Instance.new("UICorner", webhookInput).CornerRadius = UDim.new(0, 4)
+webhookInput.Parent = webhookCard
+
+local mTitle = Instance.new("TextLabel")
+mTitle.Size = UDim2.new(1, -20, 0, 16)
+mTitle.Position = UDim2.new(0, 10, 0, 64)
+mTitle.BackgroundTransparency = 1
+mTitle.Text = "Mention ID"
+mTitle.TextColor3 = Color3.fromRGB(225, 230, 240)
+mTitle.TextSize = 12
+mTitle.Font = Enum.Font.SourceSansBold
+mTitle.TextXAlignment = Enum.TextXAlignment.Left
+mTitle.ZIndex = 2
+mTitle.Parent = webhookCard
+
+local mentionInput = Instance.new("TextBox")
+mentionInput.Size = UDim2.new(1, -20, 0, 26)
+mentionInput.Position = UDim2.new(0, 10, 0, 86)
+mentionInput.BackgroundColor3 = Color3.fromRGB(12, 14, 18)
+mentionInput.PlaceholderText = "Discord User ID (例如: 803576390770229248)"
+mentionInput.Text = UserConfig.mentionId
+mentionInput.TextColor3 = Color3.fromRGB(240, 240, 245)
+mentionInput.TextSize = 11
+mentionInput.Font = Enum.Font.SourceSans
+mentionInput.ZIndex = 2
+Instance.new("UICorner", mentionInput).CornerRadius = UDim.new(0, 4)
+mentionInput.Parent = webhookCard
+
+webhookInput.FocusLost:Connect(function(enter)
+    if enter then
+        UserConfig.webhookUrl = webhookInput.Text
+        saveUserConfig()
+        print("[Webhook] URL 已儲存！")
+    end
+end)
+
+mentionInput.FocusLost:Connect(function(enter)
+    if enter then
+        UserConfig.mentionId = mentionInput.Text
+        saveUserConfig()
+        print("[Webhook] Mention ID 已儲存！")
+    end
+end)
+
+local actionCard = createBlock(pageWebhook, "", 44, 3)
+local testBtn = Instance.new("TextButton")
+testBtn.Size = UDim2.new(1, -20, 0, 28)
+testBtn.Position = UDim2.new(0, 10, 0, 8)
+testBtn.BackgroundColor3 = Color3.fromRGB(255, 105, 180)
+testBtn.Text = "🪄 Test Webhook (發送測試推播)"
+testBtn.TextColor3 = Color3.fromRGB(10, 25, 15)
+testBtn.TextSize = 11
+testBtn.Font = Enum.Font.SourceSansBold
+testBtn.ZIndex = 2
+testBtn.Parent = actionCard
+registerAccent(testBtn)
+Instance.new("UICorner", testBtn).CornerRadius = UDim.new(0, 5)
+
+testBtn.MouseButton1Click:Connect(function()
+    print("[Webhook] 正在測試推播...")
+    sendDiscordWebhook(true, 20, true)
+end)
+
+createSectionDivider(pageWebhook, "Notification", 4)
+
+createSwitch(pageWebhook, "Stage Finished", "結算時自動推送勝負狀態與金幣/寶石收益", UserConfig.notifyStageFinished, function(st)
+    UserConfig.notifyStageFinished = st
+    saveUserConfig()
+end, 5)
+
+createSwitch(pageWebhook, "Show Session Data", "戰報內附帶當次掛機總時長與累計勝率", UserConfig.notifySessionData, function(st)
+    UserConfig.notifySessionData = st
+    saveUserConfig()
+end, 6)
+
+createSwitch(pageWebhook, "Only Mention on Rare Drop", "僅在掉落稀有物品時標註 Discord ID", UserConfig.onlyMentionRare, function(st)
+    UserConfig.onlyMentionRare = st
+    saveUserConfig()
+end, 7)
+
+createSwitch(pageWebhook, "Spoiler Player Name", "推播中將玩家 ID 打上防洩密遮罩 ||ID||", UserConfig.webhookHideName, function(st)
+    UserConfig.webhookHideName = st
+    saveUserConfig()
+end, 8)
+
+-- ==================== 4. Settings 頁面 ====================
+local customUIBlock = createBlock(pageSettings, "自訂外觀與背景圖片 (Custom UI Theme)", 110, 1)
+
+local colorInput = Instance.new("TextBox")
+colorInput.Size = UDim2.new(1, -24, 0, 26)
+colorInput.Position = UDim2.new(0, 12, 0, 26)
+colorInput.BackgroundColor3 = Color3.fromRGB(12, 14, 18)
+colorInput.PlaceholderText = "主題 RGB 顏色，例如: 255, 105, 180"
+colorInput.Text = UserConfig.uiColor
+colorInput.TextColor3 = Color3.fromRGB(240, 240, 245)
+colorInput.TextSize = 11
+colorInput.Font = Enum.Font.SourceSans
+colorInput.ZIndex = 2
+Instance.new("UICorner", colorInput).CornerRadius = UDim.new(0, 4)
+colorInput.Parent = customUIBlock
+
+local bgInput = Instance.new("TextBox")
+bgInput.Size = UDim2.new(1, -24, 0, 26)
+bgInput.Position = UDim2.new(0, 12, 0, 58)
+bgInput.BackgroundColor3 = Color3.fromRGB(12, 14, 18)
+bgInput.PlaceholderText = "背景圖片 Roblox Asset ID (例如: 12345678)"
+bgInput.Text = UserConfig.bgImageId
+bgInput.TextColor3 = Color3.fromRGB(240, 240, 245)
+bgInput.TextSize = 11
+bgInput.Font = Enum.Font.SourceSans
+bgInput.ZIndex = 2
+Instance.new("UICorner", bgInput).CornerRadius = UDim.new(0, 4)
+bgInput.Parent = customUIBlock
+
+colorInput.FocusLost:Connect(function(enter)
+    if enter then
+        UserConfig.uiColor = colorInput.Text
+        saveUserConfig()
+        applyCustomTheme()
+    end
+end)
+
+bgInput.FocusLost:Connect(function(enter)
+    if enter then
+        UserConfig.bgImageId = bgInput.Text
+        saveUserConfig()
+        applyCustomTheme()
+    end
+end)
+
+local keyBlock = createBlock(pageSettings, "", 40, 2)
+local kt = Instance.new("TextLabel")
+kt.Size = UDim2.new(1, -100, 1, 0)
+kt.Position = UDim2.new(0, 12, 0, 0)
+kt.BackgroundTransparency = 1
+kt.Text = "呼出選單快捷鍵"
+kt.TextColor3 = Color3.fromRGB(225, 230, 240)
+kt.TextSize = 13
+kt.Font = Enum.Font.SourceSansBold
+kt.TextXAlignment = Enum.TextXAlignment.Left
+kt.ZIndex = 2
+kt.Parent = keyBlock
+
+local keyBtn = Instance.new("TextButton")
+keyBtn.Size = UDim2.new(0, 75, 0, 24)
+keyBtn.Position = UDim2.new(1, -85, 0.5, -12)
+keyBtn.BackgroundColor3 = Color3.fromRGB(35, 40, 48)
+keyBtn.Text = (UserConfig.toggleKey == "RightControl" and "R-Ctrl") or UserConfig.toggleKey
+keyBtn.TextColor3 = Color3.fromRGB(255, 105, 180)
+keyBtn.TextSize = 11
+keyBtn.Font = Enum.Font.SourceSansBold
+keyBtn.ZIndex = 2
+keyBtn.Parent = keyBlock
+registerAccent(keyBtn)
+Instance.new("UICorner", keyBtn).CornerRadius = UDim.new(0, 4)
+
+keyBtn.MouseButton1Click:Connect(function()
+    if isListeningKey then return end
+    isListeningKey = true
+    keyBtn.Text = "按任意鍵..."
+    local c
+    c = UserInputService.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Keyboard then
+            local kn = input.KeyCode.Name
+            UserConfig.toggleKey = kn
+            saveUserConfig()
+            keyBtn.Text = (kn == "RightControl" and "R-Ctrl") or kn
+            isListeningKey = false
+            c:Disconnect()
+        end
+    end)
+end)
+
+local mobileBtn
+
+createSwitch(pageSettings, "手機端懸浮按鈕", "在畫面左下角顯示一鍵呼出按鈕", UserConfig.mobileToggle, function(st)
+    UserConfig.mobileToggle = st
+    saveUserConfig()
+    if mobileBtn then mobileBtn.Visible = st end
+end, 3)
+
+-- 側邊導航 (4 大分頁)
 local navTabs = {
     { Name = "Macro 控制", Page = pageMacro },
-    { Name = "自動化功能", Page = pageAutomation }
+    { Name = "自動化功能", Page = pageAutomation },
+    { Name = "Webhook 戰報", Page = pageWebhook },
+    { Name = "偏好設定", Page = pageSettings }
 }
 
 for i, tab in ipairs(navTabs) do
@@ -899,14 +1322,19 @@ for i, tab in ipairs(navTabs) do
     btn.ZIndex = 3
     btn.Parent = sidebar
     Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+    if i == 1 then registerAccent(btn) end
     tab.Button = btn
 
     btn.MouseButton1Click:Connect(function()
         for _, t in ipairs(navTabs) do
             t.Page.Visible = (t == tab)
+            local r, g, b = UserConfig.uiColor:match("(%d+),%s*(%d+),%s*(%d+)")
+            local activeColor = (r and g and b) and Color3.fromRGB(tonumber(r), tonumber(g), tonumber(b)) or Color3.fromRGB(255, 105, 180)
+
             if t == tab then
                 t.Button.BackgroundColor3 = Color3.fromRGB(22, 26, 33)
-                t.Button.TextColor3 = Color3.fromRGB(255, 105, 180)
+                t.Button.TextColor3 = activeColor
+                registerAccent(t.Button)
             else
                 t.Button.BackgroundColor3 = Color3.fromRGB(11, 13, 17)
                 t.Button.TextColor3 = Color3.fromRGB(150, 155, 165)
@@ -915,14 +1343,15 @@ for i, tab in ipairs(navTabs) do
     end)
 end
 
--- 手機懸浮按鈕
-local mobileBtn = Instance.new("TextButton")
+-- 手機端懸浮按鈕
+mobileBtn = Instance.new("TextButton")
 mobileBtn.Size = UDim2.new(0, 36, 0, 36)
 mobileBtn.Position = UDim2.new(0, 16, 1, -50)
 mobileBtn.BackgroundColor3 = Color3.fromRGB(20, 23, 29)
 mobileBtn.Text = "🐷"
 mobileBtn.TextSize = 13
 mobileBtn.Font = Enum.Font.SourceSansBold
+mobileBtn.Visible = UserConfig.mobileToggle
 mobileBtn.Active = true
 mobileBtn.Draggable = true
 mobileBtn.ZIndex = 5
@@ -930,6 +1359,7 @@ mobileBtn.Parent = screenGui
 Instance.new("UICorner", mobileBtn).CornerRadius = UDim.new(0, 8)
 local mobStroke = Instance.new("UIStroke", mobileBtn)
 mobStroke.Color = Color3.fromRGB(255, 105, 180)
+registerAccent(mobStroke)
 
 mobileBtn.MouseButton1Click:Connect(function()
     mainFrame.Visible = not mainFrame.Visible
@@ -938,10 +1368,12 @@ end)
 pageMacro.Visible = true
 loadMacro(currentMacroName)
 updateMacroListView()
+applyCustomTheme()
 
 UserInputService.InputBegan:Connect(function(input, gpe)
     if gpe or isListeningKey then return end
-    if input.KeyCode == Enum.KeyCode.RightControl or input.KeyCode == Enum.KeyCode.Insert then
+    local tk = Enum.KeyCode[UserConfig.toggleKey] or Enum.KeyCode.RightControl
+    if input.KeyCode == tk or input.KeyCode == Enum.KeyCode.Insert or input.KeyCode == Enum.KeyCode.RightShift then
         mainFrame.Visible = not mainFrame.Visible
     end
 end)
