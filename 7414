@@ -1,21 +1,899 @@
-GameName = "Pizza game"
+-- ========================================================
+-- [ 7414 TD MACRO SUITE - Alliance Tower Defense 終極版 ]
+-- PlaceTower + UpgradeTower + SellTower + AutoReplay + AutoSkip
+-- ========================================================
 
-tab1name = "Main"
+if _G.Suite7414_NewGame_Running then
+    _G.Suite7414_NewGame_Running = false
+    task.wait(0.3)
+end
+_G.Suite7414_NewGame_Running = true
 
-local Library = loadstring(game:HttpGet("https://raw.githubusercontent.com/bloodball/-back-ups-for-libs/main/wizard"))()
+local Players = game:GetService("Players")
+local CoreGui = game:GetService("CoreGui")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local UserInputService = game:GetService("UserInputService")
+local HttpService = game:GetService("HttpService")
 
-local GameName = Library:NewWindow(GameName)
+local LocalPlayer = Players.LocalPlayer
 
-local Tab1 = GameName:NewSection(tab1name)
+-- 獨立存檔目錄
+local FOLDER_NAME = "alliance tower defense"
+local CONFIG_FILE_PATH = FOLDER_NAME .. "/config.json"
+local currentMacroName = "Default"
+local macroList = {}
 
-Tab1:CreateButton("繼續遊戲", function(value)
-game:GetService("ReplicatedStorage"):WaitForChild("Packages"):WaitForChild("_Index"):WaitForChild("sleitnick_net@0.1.0"):WaitForChild("net"):WaitForChild("RE/ResumeGame"):FireServer()
+-- 全域持久化設定 (粉色主題: 255, 105, 180)
+local UserConfig = {
+    currentMacro = "Default",
+    autoPlayMacro = true,
+    autoReplay = true,
+    autoSkip = true,
+    smartFastMode = true,
+    toggleKey = "RightControl",
+    mobileToggle = true,
+    uiColor = "255, 105, 180",
+    macroScale = 1.0
+}
 
+local isRecording = false
+local isPlaying = false
+local recordedActions = {}
+local lastActionTime = 0
+local isListeningKey = false
+
+local runPlayMacro, playCtrl, recordCtrl
+local applyCustomTheme, mainFrameRef
+
+-- --------------------------------------------------------
+-- 1. 座標與波次輔助函式
+-- --------------------------------------------------------
+local function getInstancePosition(inst)
+    if not inst or typeof(inst) ~= "Instance" then return nil end
+    local pos = nil
+    pcall(function()
+        if inst:IsA("Model") then
+            pos = inst:GetPivot().Position
+        elseif inst:IsA("BasePart") then
+            pos = inst.Position
+        end
+    end)
+    return pos
+end
+
+local function findNearestTower(targetPos, maxDist)
+    local bestTower = nil
+    local minDistance = maxDist or 6
+    local towersFolder = workspace:FindFirstChild("Towers")
+
+    if towersFolder and targetPos then
+        for _, child in ipairs(towersFolder:GetChildren()) do
+            local pos = getInstancePosition(child)
+            if pos then
+                local dist = (pos - targetPos).Magnitude
+                if dist < minDistance then
+                    minDistance = dist
+                    bestTower = child
+                end
+            end
+        end
+    end
+    return bestTower
+end
+
+-- 動態抓取當前波次編號
+local function getCurrentWave()
+    if workspace:FindFirstChild("Info") and workspace.Info:FindFirstChild("Wave") then
+        return tonumber(workspace.Info.Wave.Value)
+    end
+    if workspace:FindFirstChild("Wave") and workspace.Wave:IsA("ValueBase") then
+        return tonumber(workspace.Wave.Value)
+    end
+    local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+    if playerGui then
+        for _, obj in ipairs(playerGui:GetDescendants()) do
+            if obj:IsA("TextLabel") and obj.Visible then
+                local w = obj.Text:match("[Ww]ave%s*[:%-]?%s*(%d+)") or obj.Text:match("(%d+)%s*/%s*%d+")
+                if w then return tonumber(w) end
+            end
+        end
+    end
+    return nil
+end
+
+-- --------------------------------------------------------
+-- 2. 檔案與目錄管理
+-- --------------------------------------------------------
+local function ensureDirectory()
+    if isfolder and makefolder then
+        if not isfolder(FOLDER_NAME) then
+            pcall(function() makefolder(FOLDER_NAME) end)
+        end
+    end
+end
+ensureDirectory()
+
+local function saveUserConfig()
+    if not writefile then return end
+    ensureDirectory()
+    pcall(function()
+        writefile(CONFIG_FILE_PATH, HttpService:JSONEncode(UserConfig))
+    end)
+end
+
+local function loadUserConfig()
+    if isfile and isfile(CONFIG_FILE_PATH) then
+        local ok, content = pcall(function() return readfile(CONFIG_FILE_PATH) end)
+        if ok and content then
+            local decodeOk, data = pcall(function() return HttpService:JSONDecode(content) end)
+            if decodeOk and typeof(data) == "table" then
+                for k, v in pairs(data) do UserConfig[k] = v end
+                currentMacroName = UserConfig.currentMacro or "Default"
+            end
+        end
+    end
+end
+loadUserConfig()
+
+local function serializeActions(actions)
+    local serialized = {}
+    for _, step in ipairs(actions) do
+        local item = { type = step.type, delay = step.delay }
+        if step.type == "Place" then
+            item.towerName = step.towerName
+            item.cframe = {step.cframe:GetComponents()}
+        elseif step.type == "Upgrade" or step.type == "Sell" then
+            item.position = step.position and {step.position.X, step.position.Y, step.position.Z} or nil
+            item.towerName = step.towerName
+        end
+        table.insert(serialized, item)
+    end
+    return serialized
+end
+
+local function deserializeActions(data)
+    local actions = {}
+    for _, item in ipairs(data) do
+        if item.type == "Place" and item.cframe then
+            table.insert(actions, {
+                type = "Place",
+                delay = item.delay or 0,
+                towerName = item.towerName,
+                cframe = CFrame.new(unpack(item.cframe))
+            })
+        elseif (item.type == "Upgrade" or item.type == "Sell") and item.position then
+            table.insert(actions, {
+                type = item.type,
+                delay = item.delay or 0,
+                position = Vector3.new(unpack(item.position)),
+                towerName = item.towerName
+            })
+        end
+    end
+    return actions
+end
+
+local updateMacroListView
+
+local function refreshMacroList()
+    macroList = {}
+    if listfiles then
+        local files = listfiles(FOLDER_NAME)
+        for _, filePath in ipairs(files) do
+            local fileName = filePath:match("([^/\\]+)%.json$")
+            if fileName and fileName ~= "config" then
+                table.insert(macroList, fileName)
+            end
+        end
+    end
+    if #macroList == 0 then table.insert(macroList, "Default") end
+end
+
+local function saveCurrentMacro()
+    if not writefile then return end
+    ensureDirectory()
+    local path = FOLDER_NAME .. "/" .. currentMacroName .. ".json"
+    local serialized = serializeActions(recordedActions)
+    pcall(function()
+        writefile(path, HttpService:JSONEncode(serialized))
+    end)
+    UserConfig.currentMacro = currentMacroName
+    saveUserConfig()
+end
+
+local function loadMacro(name)
+    currentMacroName = name
+    UserConfig.currentMacro = name
+    saveUserConfig()
+    local path = FOLDER_NAME .. "/" .. name .. ".json"
+    recordedActions = {}
+    if isfile and isfile(path) then
+        local ok, content = pcall(function() return readfile(path) end)
+        if ok and content then
+            local decodeOk, data = pcall(function() return HttpService:JSONDecode(content) end)
+            if decodeOk and typeof(data) == "table" then
+                recordedActions = deserializeActions(data)
+                print(string.format("[ATD Macro] 已載入「%s」(共 %d 步)", name, #recordedActions))
+            end
+        end
+    end
+end
+
+local function deleteCurrentMacro()
+    local path = FOLDER_NAME .. "/" .. currentMacroName .. ".json"
+    if isfile and isfile(path) and delfile then
+        pcall(function() delfile(path) end)
+    end
+    recordedActions = {}
+    refreshMacroList()
+    currentMacroName = macroList[1] or "Default"
+    loadMacro(currentMacroName)
+    if updateMacroListView then updateMacroListView() end
+end
+
+-- --------------------------------------------------------
+-- 3. Hook 動作捕捉 (PlaceTower / UpgradeTower / SellTower)
+-- --------------------------------------------------------
+local oldNamecall
+oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
+    local method = getnamecallmethod()
+    local args = {...}
+
+    if isRecording and not isPlaying and not checkcaller() then
+        if method == "InvokeServer" or method == "invokeServer" then
+            -- 1. 放塔
+            if self and self.Name == "PlaceTower" then
+                local now = os.clock()
+                local delay = (#recordedActions == 0) and 0 or (now - lastActionTime)
+                lastActionTime = now
+
+                table.insert(recordedActions, {
+                    type = "Place",
+                    delay = delay,
+                    towerName = args[1],
+                    cframe = args[2]
+                })
+                print(string.format("[ATD 捕捉] 放塔: %s (步數: %d)", tostring(args[1]), #recordedActions))
+
+            -- 2. 升級塔
+            elseif self and self.Name == "UpgradeTower" then
+                local now = os.clock()
+                local delay = (#recordedActions == 0) and 0 or (now - lastActionTime)
+                lastActionTime = now
+
+                local inst = args[1]
+                local pos = getInstancePosition(inst)
+
+                table.insert(recordedActions, {
+                    type = "Upgrade",
+                    delay = delay,
+                    position = pos,
+                    towerName = inst and inst.Name or "Tower"
+                })
+                print(string.format("[ATD 捕捉] 升級: %s (步數: %d)", tostring(inst and inst.Name), #recordedActions))
+
+            -- 3. 賣塔
+            elseif self and self.Name == "SellTower" then
+                local now = os.clock()
+                local delay = (#recordedActions == 0) and 0 or (now - lastActionTime)
+                lastActionTime = now
+
+                local inst = args[1]
+                local pos = getInstancePosition(inst)
+
+                table.insert(recordedActions, {
+                    type = "Sell",
+                    delay = delay,
+                    position = pos,
+                    towerName = inst and inst.Name or "Tower"
+                })
+                print(string.format("[ATD 捕捉] 販賣: %s (步數: %d)", tostring(inst and inst.Name), #recordedActions))
+            end
+        end
+    end
+
+    setnamecallmethod(method)
+    return oldNamecall(self, ...)
+end))
+
+-- --------------------------------------------------------
+-- 4. 自動守護線程 (Auto Skip & Auto Replay)
+-- --------------------------------------------------------
+task.spawn(function()
+    task.wait(2.0)
+    local hasTriggeredReplay = false
+    local lastVotedWave = -1
+
+    while _G.Suite7414_NewGame_Running do
+        task.wait(0.6)
+
+        -- 1. 自動跳波 (Auto Skip)
+        if UserConfig.autoSkip then
+            local currentWave = getCurrentWave()
+            if currentWave and currentWave ~= lastVotedWave then
+                pcall(function()
+                    local skipEvent = ReplicatedStorage:FindFirstChild("RemoteEvents") and ReplicatedStorage.RemoteEvents:FindFirstChild("SkipWaveVote")
+                    if skipEvent then
+                        skipEvent:FireServer(currentWave)
+                        lastVotedWave = currentWave
+                        print(string.format("[Auto Skip] 已自動發送跳波投票 (Wave %d)", currentWave))
+                    end
+                end)
+            elseif not currentWave then
+                -- 若無法取得具體波次，定時輔助觸發
+                pcall(function()
+                    local skipEvent = ReplicatedStorage:FindFirstChild("RemoteEvents") and ReplicatedStorage.RemoteEvents:FindFirstChild("SkipWaveVote")
+                    if skipEvent then
+                        skipEvent:FireServer(1)
+                    end
+                end)
+            end
+        end
+
+        -- 2. 自動重開 (Auto Replay)
+        if UserConfig.autoReplay then
+            local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+            local isGameOver = false
+
+            if playerGui then
+                for _, gui in ipairs(playerGui:GetChildren()) do
+                    if gui:IsA("ScreenGui") and gui.Enabled then
+                        local endFrame = gui:FindFirstChild("EndScreen", true) 
+                            or gui:FindFirstChild("Victory", true) 
+                            or gui:FindFirstChild("GameOver", true)
+                            or gui:FindFirstChild("Replay", true)
+                            or gui:FindFirstChild("ReplayVote", true)
+
+                        if endFrame and (endFrame:IsA("GuiObject") and endFrame.Visible) then
+                            isGameOver = true
+                            break
+                        end
+                    end
+                end
+            end
+
+            if isGameOver and not hasTriggeredReplay then
+                hasTriggeredReplay = true
+                print("[Auto Replay] 偵測到結算畫面，發送 ReplayVote 投票重開！")
+
+                task.spawn(function()
+                    for attempt = 1, 6 do
+                        if not _G.Suite7414_NewGame_Running then break end
+
+                        pcall(function()
+                            local replayEvent = ReplicatedStorage:FindFirstChild("RemoteEvents") and ReplicatedStorage.RemoteEvents:FindFirstChild("ReplayVote")
+                            if replayEvent then
+                                replayEvent:FireServer()
+                            end
+                        end)
+
+                        task.wait(0.8)
+                    end
+                end)
+            elseif not isGameOver then
+                hasTriggeredReplay = false
+            end
+        end
+    end
 end)
 
-Tab1:CreateButton("ZAWARUDO", function(value)
-game:GetService("ReplicatedStorage"):WaitForChild("Packages"):WaitForChild("_Index"):WaitForChild("sleitnick_net@0.1.0"):WaitForChild("net"):WaitForChild("RE/PauseGame"):FireServer()
+-- --------------------------------------------------------
+-- 5. 巨集重播核心 (等錢秒放 + 等錢秒升 + 精準賣塔)
+-- --------------------------------------------------------
+runPlayMacro = function(st)
+    if isRecording then
+        if playCtrl then playCtrl.Set(false) end
+        return
+    end
 
+    if st then
+        if #recordedActions == 0 then
+            warn("[ATD 提示] 目前檔案無動作記錄，請先開啟錄製。")
+            if playCtrl then playCtrl.Set(false) end
+            return
+        end
+
+        task.spawn(function()
+            isPlaying = true
+            if playCtrl then playCtrl.Set(true) end
+            print(string.format("[ATD 重播開始] 執行「%s」，共 %d 步 (等錢秒升模式)", currentMacroName, #recordedActions))
+
+            for i, step in ipairs(recordedActions) do
+                if not isPlaying or not _G.Suite7414_NewGame_Running then break end
+                if playCtrl then
+                    playCtrl.SetDesc(string.format("▶ 執行中 (%d/%d 步)...", i, #recordedActions))
+                end
+
+                if step.delay > 0 then
+                    local targetWait = UserConfig.smartFastMode and math.clamp(step.delay * 0.1, 0.15, 1.0) or (step.delay * UserConfig.macroScale)
+                    local waited = 0
+                    while waited < targetWait and isPlaying and _G.Suite7414_NewGame_Running do
+                        task.wait(0.05)
+                        waited = waited + 0.05
+                    end
+                end
+
+                if not isPlaying or not _G.Suite7414_NewGame_Running then break end
+
+                local rfFolder = ReplicatedStorage:FindFirstChild("RemoteFunctions")
+                if not rfFolder then break end
+
+                -- 1. 放塔
+                if step.type == "Place" then
+                    local placeFunc = rfFolder:FindFirstChild("PlaceTower")
+                    if placeFunc then
+                        while isPlaying and _G.Suite7414_NewGame_Running do
+                            local res = nil
+                            pcall(function()
+                                res = placeFunc:InvokeServer(step.towerName, step.cframe)
+                            end)
+
+                            local spawnedTower = findNearestTower(step.cframe.Position, 5)
+                            if (res ~= false and res ~= nil) or spawnedTower then
+                                print(string.format("[ATD 放塔成功] (%d/%d) %s", i, #recordedActions, tostring(step.towerName)))
+                                task.wait(0.3)
+                                break
+                            end
+                            task.wait(0.25)
+                        end
+                    end
+
+                -- 2. 升級 (等錢秒升)
+                elseif step.type == "Upgrade" then
+                    local upgradeFunc = rfFolder:FindFirstChild("UpgradeTower")
+                    if upgradeFunc and step.position then
+                        while isPlaying and _G.Suite7414_NewGame_Running do
+                            local target = findNearestTower(step.position, 6)
+                            if target then
+                                local res = nil
+                                pcall(function()
+                                    res = upgradeFunc:InvokeServer(target)
+                                end)
+
+                                if res ~= false and res ~= nil then
+                                    print(string.format("[ATD 升級成功] (%d/%d) %s", i, #recordedActions, tostring(step.towerName)))
+                                    task.wait(0.3)
+                                    break
+                                end
+                            end
+                            task.wait(0.25)
+                        end
+                    end
+
+                -- 3. 販賣
+                elseif step.type == "Sell" then
+                    local sellFunc = rfFolder:FindFirstChild("SellTower")
+                    if sellFunc and step.position then
+                        while isPlaying and _G.Suite7414_NewGame_Running do
+                            local target = findNearestTower(step.position, 6)
+                            if target then
+                                pcall(function() sellFunc:InvokeServer(target) end)
+                                print(string.format("[ATD 賣塔成功] (%d/%d) %s", i, #recordedActions, tostring(step.towerName)))
+                                task.wait(0.25)
+                                break
+                            else
+                                break
+                            end
+                        end
+                    end
+                end
+            end
+
+            task.wait(0.5)
+            isPlaying = false
+            if playCtrl then
+                playCtrl.Set(false)
+                playCtrl.SetDesc(string.format("✓ 重播已完成 (共 %d 步)", #recordedActions))
+            end
+        end)
+    else
+        isPlaying = false
+        if playCtrl then
+            playCtrl.Set(false)
+            playCtrl.SetDesc(string.format("檔案: %s (共 %d 步動作)", currentMacroName, #recordedActions))
+        end
+    end
+end
+
+-- --------------------------------------------------------
+-- 6. UI 介面構建 (粉色主題版)
+-- --------------------------------------------------------
+local parentGui = (gethui and gethui()) or CoreGui:FindFirstChild("RobloxGui") or LocalPlayer:WaitForChild("PlayerGui")
+if parentGui:FindFirstChild("Suite7414UI") then
+    parentGui.Suite7414UI:Destroy()
+end
+
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "Suite7414UI"
+screenGui.ResetOnSpawn = false
+screenGui.Parent = parentGui
+
+local mainFrame = Instance.new("Frame")
+mainFrame.Size = UDim2.new(0, 620, 0, 420)
+mainFrame.Position = UDim2.new(0.5, -310, 0.5, -210)
+mainFrame.BackgroundColor3 = Color3.fromRGB(15, 17, 21)
+mainFrame.BorderSizePixel = 0
+mainFrame.Active = true
+mainFrame.Draggable = true
+mainFrame.Parent = screenGui
+mainFrameRef = mainFrame
+Instance.new("UICorner", mainFrame).CornerRadius = UDim.new(0, 10)
+
+local mainStroke = Instance.new("UIStroke", mainFrame)
+mainStroke.Color = Color3.fromRGB(35, 40, 48)
+mainStroke.Thickness = 1.2
+
+local sidebar = Instance.new("Frame")
+sidebar.Size = UDim2.new(0, 160, 1, 0)
+sidebar.BackgroundColor3 = Color3.fromRGB(11, 13, 17)
+sidebar.BorderSizePixel = 0
+sidebar.ZIndex = 2
+sidebar.Parent = mainFrame
+Instance.new("UICorner", sidebar).CornerRadius = UDim.new(0, 10)
+
+local brandHeader = Instance.new("Frame")
+brandHeader.Size = UDim2.new(1, 0, 0, 50)
+brandHeader.BackgroundTransparency = 1
+brandHeader.ZIndex = 3
+brandHeader.Parent = sidebar
+
+local brandBadge = Instance.new("TextLabel")
+brandBadge.Size = UDim2.new(0, 26, 0, 26)
+brandBadge.Position = UDim2.new(0, 12, 0, 12)
+brandBadge.BackgroundColor3 = Color3.fromRGB(255, 105, 180)
+brandBadge.Text = "🐷"
+brandBadge.TextSize = 13
+brandBadge.ZIndex = 3
+brandBadge.Parent = brandHeader
+Instance.new("UICorner", brandBadge).CornerRadius = UDim.new(0, 6)
+
+local brandTitle = Instance.new("TextLabel")
+brandTitle.Size = UDim2.new(1, -50, 1, 0)
+brandTitle.Position = UDim2.new(0, 46, 0, 0)
+brandTitle.BackgroundTransparency = 1
+brandTitle.Text = "7414 • ATD"
+brandTitle.TextColor3 = Color3.fromRGB(240, 245, 250)
+brandTitle.TextSize = 13
+brandTitle.Font = Enum.Font.SourceSansBold
+brandTitle.TextXAlignment = Enum.TextXAlignment.Left
+brandTitle.ZIndex = 3
+brandTitle.Parent = brandHeader
+
+local contentArea = Instance.new("Frame")
+contentArea.Size = UDim2.new(1, -160, 1, 0)
+contentArea.Position = UDim2.new(0, 160, 0, 0)
+contentArea.BackgroundTransparency = 1
+contentArea.ZIndex = 2
+contentArea.Parent = mainFrame
+
+local function createPage(name)
+    local p = Instance.new("ScrollingFrame")
+    p.Name = name
+    p.Size = UDim2.new(1, -20, 1, -20)
+    p.Position = UDim2.new(0, 10, 0, 10)
+    p.BackgroundTransparency = 1
+    p.BorderSizePixel = 0
+    p.ScrollBarThickness = 3
+    p.ScrollBarImageColor3 = Color3.fromRGB(45, 52, 65)
+    p.Visible = false
+    p.ZIndex = 2
+    p.Parent = contentArea
+    local l = Instance.new("UIListLayout", p)
+    l.SortOrder = Enum.SortOrder.LayoutOrder
+    l.Padding = UDim.new(0, 6)
+    return p
+end
+
+local pageMacro = createPage("Macro")
+local pageAutomation = createPage("Automation")
+
+local function createBlock(parent, title, height, order)
+    local frame = Instance.new("Frame")
+    frame.Size = UDim2.new(1, -6, 0, height)
+    frame.BackgroundColor3 = Color3.fromRGB(20, 23, 29)
+    frame.BackgroundTransparency = 0.2
+    frame.BorderSizePixel = 0
+    frame.LayoutOrder = order or 0
+    frame.ZIndex = 2
+    frame.Parent = parent
+    Instance.new("UICorner", frame).CornerRadius = UDim.new(0, 6)
+    Instance.new("UIStroke", frame).Color = Color3.fromRGB(30, 35, 44)
+
+    if title and title ~= "" then
+        local t = Instance.new("TextLabel")
+        t.Size = UDim2.new(1, -16, 0, 20)
+        t.Position = UDim2.new(0, 10, 0, 5)
+        t.BackgroundTransparency = 1
+        t.Text = title
+        t.TextColor3 = Color3.fromRGB(150, 160, 175)
+        t.TextSize = 11
+        t.Font = Enum.Font.SourceSansBold
+        t.TextXAlignment = Enum.TextXAlignment.Left
+        t.ZIndex = 2
+        t.Parent = frame
+    end
+    return frame
+end
+
+local function createSwitch(parent, title, desc, defaultVal, callback, order)
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, -6, 0, (desc and desc ~= "") and 52 or 38)
+    btn.BackgroundColor3 = Color3.fromRGB(20, 23, 29)
+    btn.BackgroundTransparency = 0.2
+    btn.BorderSizePixel = 0
+    btn.LayoutOrder = order or 0
+    btn.Text = ""
+    btn.AutoButtonColor = false
+    btn.ZIndex = 2
+    btn.Parent = parent
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+    local stroke = Instance.new("UIStroke", btn)
+    stroke.Color = Color3.fromRGB(30, 35, 44)
+
+    local t = Instance.new("TextLabel")
+    t.Size = UDim2.new(1, -70, 0, 18)
+    t.Position = UDim2.new(0, 12, 0, 4)
+    t.BackgroundTransparency = 1
+    t.Text = title
+    t.TextColor3 = Color3.fromRGB(225, 230, 240)
+    t.TextSize = 13
+    t.Font = Enum.Font.SourceSansBold
+    t.TextXAlignment = Enum.TextXAlignment.Left
+    t.ZIndex = 2
+    t.Parent = btn
+
+    local d = Instance.new("TextLabel")
+    d.Size = UDim2.new(1, -70, 0, 24)
+    d.Position = UDim2.new(0, 12, 0, 22)
+    d.BackgroundTransparency = 1
+    d.Text = desc or ""
+    d.TextColor3 = Color3.fromRGB(125, 135, 150)
+    d.TextSize = 10
+    d.Font = Enum.Font.SourceSans
+    d.TextXAlignment = Enum.TextXAlignment.Left
+    d.ZIndex = 2
+    t.Parent = btn
+
+    local switchBox = Instance.new("Frame")
+    switchBox.Size = UDim2.new(0, 44, 0, 20)
+    switchBox.Position = UDim2.new(1, -54, 0.5, -10)
+    switchBox.BackgroundColor3 = defaultVal and Color3.fromRGB(255, 105, 180) or Color3.fromRGB(35, 40, 48)
+    switchBox.BorderSizePixel = 0
+    switchBox.ZIndex = 2
+    switchBox.Parent = btn
+    Instance.new("UICorner", switchBox).CornerRadius = UDim.new(0, 10)
+
+    local switchLabel = Instance.new("TextLabel")
+    switchLabel.Size = UDim2.new(1, 0, 1, 0)
+    switchLabel.BackgroundTransparency = 1
+    switchLabel.Text = defaultVal and "ON" or "OFF"
+    switchLabel.TextColor3 = defaultVal and Color3.fromRGB(10, 25, 15) or Color3.fromRGB(150, 155, 165)
+    switchLabel.TextSize = 10
+    switchLabel.Font = Enum.Font.SourceSansBold
+    switchLabel.ZIndex = 2
+    switchLabel.Parent = switchBox
+
+    local state = defaultVal
+    local ctrl = {}
+    function ctrl.Set(v)
+        state = v
+        switchBox.BackgroundColor3 = state and Color3.fromRGB(255, 105, 180) or Color3.fromRGB(35, 40, 48)
+        switchLabel.TextColor3 = state and Color3.fromRGB(10, 25, 15) or Color3.fromRGB(150, 155, 165)
+        switchLabel.Text = state and "ON" or "OFF"
+    end
+    function ctrl.SetDesc(newDesc)
+        d.Text = newDesc
+    end
+
+    btn.MouseButton1Click:Connect(function()
+        state = not state
+        ctrl.Set(state)
+        if callback then callback(state, ctrl) end
+    end)
+    return ctrl
+end
+
+-- ==================== 1. Macro 頁面 ====================
+local profileBlock = createBlock(pageMacro, "MACRO 檔案配置", 110, 1)
+
+local inputName = Instance.new("TextBox")
+inputName.Size = UDim2.new(0, 180, 0, 26)
+inputName.Position = UDim2.new(0, 10, 0, 26)
+inputName.BackgroundColor3 = Color3.fromRGB(12, 14, 18)
+inputName.PlaceholderText = "+ 新增檔案名稱 (Enter)"
+inputName.PlaceholderColor3 = Color3.fromRGB(90, 95, 105)
+inputName.Text = ""
+inputName.TextColor3 = Color3.fromRGB(240, 240, 245)
+inputName.TextSize = 11
+inputName.Font = Enum.Font.SourceSans
+inputName.ZIndex = 2
+Instance.new("UICorner", inputName).CornerRadius = UDim.new(0, 4)
+inputName.Parent = profileBlock
+
+local delBtn = Instance.new("TextButton")
+delBtn.Size = UDim2.new(0, 80, 0, 26)
+delBtn.Position = UDim2.new(0, 200, 0, 26)
+delBtn.BackgroundColor3 = Color3.fromRGB(160, 45, 45)
+delBtn.Text = "刪除當前"
+delBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+delBtn.TextSize = 11
+delBtn.Font = Enum.Font.SourceSansBold
+delBtn.ZIndex = 2
+Instance.new("UICorner", delBtn).CornerRadius = UDim.new(0, 4)
+delBtn.Parent = profileBlock
+
+delBtn.MouseButton1Click:Connect(function()
+    deleteCurrentMacro()
 end)
 
-local Tab2 = GameName:NewSection("7414")
+local macroScroll = Instance.new("ScrollingFrame")
+macroScroll.Size = UDim2.new(1, -20, 0, 44)
+macroScroll.Position = UDim2.new(0, 10, 0, 58)
+macroScroll.BackgroundColor3 = Color3.fromRGB(12, 14, 18)
+macroScroll.BorderSizePixel = 0
+macroScroll.ScrollBarThickness = 2
+macroScroll.ZIndex = 2
+macroScroll.Parent = profileBlock
+Instance.new("UICorner", macroScroll).CornerRadius = UDim.new(0, 4)
+
+local macroListLayout = Instance.new("UIListLayout", macroScroll)
+macroListLayout.FillDirection = Enum.FillDirection.Horizontal
+macroListLayout.Padding = UDim.new(0, 4)
+
+updateMacroListView = function()
+    refreshMacroList()
+    for _, ch in ipairs(macroScroll:GetChildren()) do
+        if ch:IsA("TextButton") then ch:Destroy() end
+    end
+    for _, name in ipairs(macroList) do
+        local isCur = (name == currentMacroName)
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(0, 110, 0, 30)
+        btn.BackgroundColor3 = isCur and Color3.fromRGB(255, 105, 180) or Color3.fromRGB(24, 28, 35)
+        btn.Text = name
+        btn.TextColor3 = isCur and Color3.fromRGB(10, 25, 15) or Color3.fromRGB(180, 185, 195)
+        btn.TextSize = 11
+        btn.Font = Enum.Font.SourceSansBold
+        btn.ZIndex = 2
+        btn.Parent = macroScroll
+        Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 4)
+
+        btn.MouseButton1Click:Connect(function()
+            loadMacro(name)
+            updateMacroListView()
+        end)
+    end
+    macroScroll.CanvasSize = UDim2.new(0, #macroList * 116, 0, 0)
+end
+
+inputName.FocusLost:Connect(function(enter)
+    if enter and inputName.Text:gsub("%s+", "") ~= "" then
+        currentMacroName = inputName.Text:gsub("[^%w%s_%-]", "")
+        recordedActions = {}
+        saveCurrentMacro()
+        inputName.Text = ""
+        updateMacroListView()
+    end
+end)
+
+playCtrl = createSwitch(pageMacro, "執行重播 (Play Macro)", "當前載入: 0 步動作", false, function(st)
+    runPlayMacro(st)
+end, 2)
+
+createSwitch(pageMacro, "智慧節奏壓縮 (Smart Fast Mode)", "大幅縮減無效等待，等錢自動秒放與秒升", UserConfig.smartFastMode, function(st)
+    UserConfig.smartFastMode = st
+    saveUserConfig()
+end, 3)
+
+recordCtrl = createSwitch(pageMacro, "錄製操作 (Record Macro)", "開啟後於遊戲中放塔、升級與賣塔", false, function(st, ctrl)
+    if isPlaying then
+        ctrl.Set(false)
+        return
+    end
+    isRecording = st
+    if isRecording then
+        recordedActions = {}
+        lastActionTime = os.clock()
+        print(string.format("[ATD] 開始錄製至「%s」", currentMacroName))
+    else
+        saveCurrentMacro()
+        print(string.format("[ATD] 結束錄製，已存 %d 步動作", #recordedActions))
+    end
+end, 4)
+
+task.spawn(function()
+    local lastCount = -1
+    local lastState = false
+    while _G.Suite7414_NewGame_Running do
+        task.wait(0.2)
+        if #recordedActions ~= lastCount or isRecording ~= lastState then
+            lastCount = #recordedActions
+            lastState = isRecording
+            pcall(function()
+                if recordCtrl then
+                    recordCtrl.SetDesc(isRecording and string.format("● 錄製中... (已捕捉 %d 步動作)", #recordedActions) or "開啟後於遊戲中放塔、升級與賣塔")
+                end
+                if playCtrl and not isPlaying then
+                    playCtrl.SetDesc(string.format("檔案: %s (共 %d 步動作)", currentMacroName, #recordedActions))
+                end
+            end)
+        end
+    end
+end)
+
+-- ==================== 2. Automation 頁面 ====================
+createSwitch(pageAutomation, "自動跳過波次 (Auto Skip)", "波次刷新時自動向 SkipWaveVote 發送投票跳過", UserConfig.autoSkip, function(st)
+    UserConfig.autoSkip = st
+    saveUserConfig()
+end, 1)
+
+createSwitch(pageAutomation, "自動重開/投票 (Auto Replay)", "結算出現時自動發送 ReplayVote 投票重啟", UserConfig.autoReplay, function(st)
+    UserConfig.autoReplay = st
+    saveUserConfig()
+end, 2)
+
+-- 側邊選單導航
+local navTabs = {
+    { Name = "Macro 控制", Page = pageMacro },
+    { Name = "自動化功能", Page = pageAutomation }
+}
+
+for i, tab in ipairs(navTabs) do
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, -16, 0, 36)
+    btn.Position = UDim2.new(0, 8, 0, 60 + (i - 1) * 42)
+    btn.BackgroundColor3 = (i == 1) and Color3.fromRGB(22, 26, 33) or Color3.fromRGB(11, 13, 17)
+    btn.Text = "    " .. tab.Name
+    btn.TextColor3 = (i == 1) and Color3.fromRGB(255, 105, 180) or Color3.fromRGB(150, 155, 165)
+    btn.TextSize = 12
+    btn.Font = Enum.Font.SourceSansBold
+    btn.TextXAlignment = Enum.TextXAlignment.Left
+    btn.ZIndex = 3
+    btn.Parent = sidebar
+    Instance.new("UICorner", btn).CornerRadius = UDim.new(0, 6)
+    tab.Button = btn
+
+    btn.MouseButton1Click:Connect(function()
+        for _, t in ipairs(navTabs) do
+            t.Page.Visible = (t == tab)
+            if t == tab then
+                t.Button.BackgroundColor3 = Color3.fromRGB(22, 26, 33)
+                t.Button.TextColor3 = Color3.fromRGB(255, 105, 180)
+            else
+                t.Button.BackgroundColor3 = Color3.fromRGB(11, 13, 17)
+                t.Button.TextColor3 = Color3.fromRGB(150, 155, 165)
+            end
+        end
+    end)
+end
+
+-- 手機懸浮按鈕
+local mobileBtn = Instance.new("TextButton")
+mobileBtn.Size = UDim2.new(0, 36, 0, 36)
+mobileBtn.Position = UDim2.new(0, 16, 1, -50)
+mobileBtn.BackgroundColor3 = Color3.fromRGB(20, 23, 29)
+mobileBtn.Text = "🐷"
+mobileBtn.TextSize = 13
+mobileBtn.Font = Enum.Font.SourceSansBold
+mobileBtn.Active = true
+mobileBtn.Draggable = true
+mobileBtn.ZIndex = 5
+mobileBtn.Parent = screenGui
+Instance.new("UICorner", mobileBtn).CornerRadius = UDim.new(0, 8)
+local mobStroke = Instance.new("UIStroke", mobileBtn)
+mobStroke.Color = Color3.fromRGB(255, 105, 180)
+
+mobileBtn.MouseButton1Click:Connect(function()
+    mainFrame.Visible = not mainFrame.Visible
+end)
+
+pageMacro.Visible = true
+loadMacro(currentMacroName)
+updateMacroListView()
+
+UserInputService.InputBegan:Connect(function(input, gpe)
+    if gpe or isListeningKey then return end
+    if input.KeyCode == Enum.KeyCode.RightControl or input.KeyCode == Enum.KeyCode.Insert then
+        mainFrame.Visible = not mainFrame.Visible
+    end
+end)
