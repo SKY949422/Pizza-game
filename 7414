@@ -1,6 +1,6 @@
 -- ========================================================
--- [ 7414 TD MACRO SUITE - Alliance Tower Defense 旗艦版 ]
--- Macro + Automation + Webhook 戰報 + 偏好設定 (粉色主題)
+-- [ 7414 TD MACRO SUITE - Alliance Tower Defense 終極修正版 ]
+-- 全塔相容放塔 Hook + 等錢秒升 + 賣塔 + 自動重開 + 自動跳波 + Webhook
 -- ========================================================
 
 if _G.Suite7414_NewGame_Running then
@@ -59,6 +59,11 @@ local isListeningKey = false
 local matchStartTime = os.time()
 local initialCurrencies = {}
 
+-- 波次進度追蹤
+local currentMatchWave = 1
+local currentMatchMaxWave = 20
+local highestWaveReached = 1
+
 local runPlayMacro, playCtrl, recordCtrl
 local applyCustomTheme, bgImageLabel, mainFrameRef
 
@@ -110,72 +115,120 @@ local function formatSessionTime(seconds)
 end
 
 -- --------------------------------------------------------
--- 2. 座標、波次與 Webhook 戰報核心
+-- 2. GUI 與波次檢測 (包含可見度鏈條檢查)
 -- --------------------------------------------------------
-local function getInstancePosition(inst)
-    if not inst or typeof(inst) ~= "Instance" then return nil end
-    local pos = nil
-    pcall(function()
-        if inst:IsA("Model") then
-            pos = inst:GetPivot().Position
-        elseif inst:IsA("BasePart") then
-            pos = inst.Position
-        end
-    end)
-    return pos
+local function isGuiElementVisible(obj)
+    if not obj or not obj:IsA("GuiObject") then return false end
+    local cur = obj
+    while cur and cur:IsA("GuiObject") do
+        if not cur.Visible then return false end
+        cur = cur.Parent
+    end
+    if cur and cur:IsA("ScreenGui") and not cur.Enabled then return false end
+    return true
 end
 
-local function findNearestTower(targetPos, maxDist)
-    local bestTower = nil
-    local minDistance = maxDist or 6
-    local towersFolder = workspace:FindFirstChild("Towers")
-
-    if towersFolder and targetPos then
-        for _, child in ipairs(towersFolder:GetChildren()) do
-            local pos = getInstancePosition(child)
-            if pos then
-                local dist = (pos - targetPos).Magnitude
-                if dist < minDistance then
-                    minDistance = dist
-                    bestTower = child
+local function updateWaveInfo()
+    local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+    if playerGui then
+        for _, obj in ipairs(playerGui:GetDescendants()) do
+            if obj:IsA("TextLabel") and isGuiElementVisible(obj) then
+                local c, m = obj.Text:match("[Ww]ave%s*(%d+)%s*/%s*(%d+)")
+                if not c then
+                    c, m = obj.Text:match("(%d+)%s*/%s*(%d+)")
+                end
+                if c and m then
+                    currentMatchWave = tonumber(c)
+                    currentMatchMaxWave = tonumber(m)
+                    if currentMatchWave > highestWaveReached then
+                        highestWaveReached = currentMatchWave
+                    end
+                    return currentMatchWave, currentMatchMaxWave
                 end
             end
         end
     end
-    return bestTower
-end
 
-local function getCurrentWave()
     local info = workspace:FindFirstChild("Info") or workspace:FindFirstChild("GameInfo")
     if info then
         local w = info:FindFirstChild("Wave") or info:FindFirstChild("CurrentWave")
         if w and w:IsA("ValueBase") and tonumber(w.Value) then
-            return tonumber(w.Value)
-        end
-    end
-    if workspace:FindFirstChild("Wave") and workspace.Wave:IsA("ValueBase") then
-        return tonumber(workspace.Wave.Value)
-    end
-
-    local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
-    if playerGui then
-        for _, obj in ipairs(playerGui:GetDescendants()) do
-            if obj:IsA("TextLabel") and obj.Visible then
-                local wMatch = obj.Text:match("[Ww]ave%s*(%d+)%s*/") or obj.Text:match("[Ww]ave%s*[:%-]?%s*(%d+)")
-                if wMatch then return tonumber(wMatch) end
+            currentMatchWave = tonumber(w.Value)
+            if currentMatchWave > highestWaveReached then
+                highestWaveReached = currentMatchWave
             end
         end
     end
-    return nil
+    return currentMatchWave, currentMatchMaxWave
 end
 
-local trackedCurrencies = {"Coins", "Gems", "Gold", "Tokens", "Cash", "Exp", "Experience"}
+local function checkGameResult()
+    local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+    if not playerGui then return false, false end
+
+    local isGameOver = false
+    local isWin = false
+    local victorySignals = 0
+    local defeatSignals = 0
+
+    for _, gui in ipairs(playerGui:GetChildren()) do
+        if gui:IsA("ScreenGui") and gui.Enabled then
+            for _, desc in ipairs(gui:GetDescendants()) do
+                if isGuiElementVisible(desc) then
+                    if desc:IsA("TextLabel") or desc:IsA("TextButton") then
+                        local txt = string.upper(desc.Text or "")
+                        if txt:find("VICTORY") or txt:find("YOU WIN") or txt:find("勝利") or txt:find("STAGE CLEARED") or txt:find("GAME WON") then
+                            victorySignals = victorySignals + 1
+                            isGameOver = true
+                        elseif txt:find("DEFEAT") or txt:find("GAME OVER") or txt:find("失敗") or txt:find("YOU LOSE") or txt:find("FAILED") then
+                            defeatSignals = defeatSignals + 1
+                            isGameOver = true
+                        elseif desc.Name == "ReplayVote" or txt:find("REPLAY") or txt:find("VOTE") or txt:find("重玩") or txt:find("RETRY") then
+                            isGameOver = true
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    if isGameOver then
+        if victorySignals > 0 and victorySignals >= defeatSignals then
+            isWin = true
+        elseif currentMatchMaxWave > 0 and highestWaveReached >= currentMatchMaxWave then
+            isWin = true
+        elseif defeatSignals > 0 and defeatSignals > victorySignals then
+            isWin = false
+        else
+            isWin = false
+        end
+    end
+
+    return isGameOver, isWin
+end
+
+-- --------------------------------------------------------
+-- 3. 貨幣過濾與 Webhook 戰報 (排除局內 Cash)
+-- --------------------------------------------------------
+local blacklistedKeys = {
+    ["cash"] = true, ["money"] = true, ["dollar"] = true, ["dollars"] = true,
+    ["matchcash"] = true, ["hp"] = true, ["health"] = true, ["basehealth"] = true,
+    ["wave"] = true, ["waves"] = true, ["win"] = true, ["wins"] = true,
+    ["loss"] = true, ["losses"] = true
+}
+
+local function isBlacklisted(name)
+    local lower = string.lower(name)
+    for k in pairs(blacklistedKeys) do
+        if lower:find(k) then return true end
+    end
+    return false
+end
 
 local function snapshotCurrencies()
     initialCurrencies = {}
     local function recordVal(name, val)
-        local lower = string.lower(name)
-        if lower ~= "money" and lower ~= "matchcash" then
+        if not isBlacklisted(name) then
             if initialCurrencies[name] == nil then initialCurrencies[name] = val end
         end
     end
@@ -189,10 +242,32 @@ local function snapshotCurrencies()
 
     scan(LocalPlayer:FindFirstChild("leaderstats"))
     scan(LocalPlayer:FindFirstChild("Currencies"))
-    for _, name in ipairs(trackedCurrencies) do
-        local obj = LocalPlayer:FindFirstChild(name)
-        if obj and obj:IsA("ValueBase") then recordVal(name, obj.Value) end
+    scan(LocalPlayer:FindFirstChild("Data"))
+end
+
+local function scanEndScreenRewards()
+    local rewards = {}
+    local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+    if not playerGui then return rewards end
+
+    for _, gui in ipairs(playerGui:GetChildren()) do
+        if gui:IsA("ScreenGui") and gui.Enabled then
+            for _, desc in ipairs(gui:GetDescendants()) do
+                if desc:IsA("TextLabel") and isGuiElementVisible(desc) then
+                    local txt = desc.Text or ""
+                    local num, curName = txt:match("%+?(%d+[,%d]*)%s*([Cc]oins?)")
+                    if not num then num, curName = txt:match("%+?(%d+[,%d]*)%s*([Gg]ems?)") end
+                    if not num then num, curName = txt:match("%+?(%d+[,%d]*)%s*([Ee][Xx][Pp])") end
+                    if not num then num, curName = txt:match("%+?(%d+[,%d]*)%s*([Tt]okens?)") end
+
+                    if num and curName and not isBlacklisted(curName) then
+                        table.insert(rewards, string.format("• %s: +%s", curName, num))
+                    end
+                end
+            end
+        end
     end
+    return rewards
 end
 
 local function sendDiscordWebhook(isVictory, wavesBeaten, isTest)
@@ -207,16 +282,18 @@ local function sendDiscordWebhook(isVictory, wavesBeaten, isTest)
 
     local rewardsList = {}
     local isRareDrop = false
+    local processedKeys = {}
 
     local function scanForDeltas(container)
         if not container then return end
         for _, child in ipairs(container:GetChildren()) do
-            if child:IsA("ValueBase") and typeof(child.Value) == "number" then
+            if child:IsA("ValueBase") and typeof(child.Value) == "number" and not isBlacklisted(child.Name) then
                 local init = initialCurrencies[child.Name] or child.Value
                 local delta = child.Value - init
-                if delta > 0 then
+                if delta > 0 and not processedKeys[child.Name] then
+                    processedKeys[child.Name] = true
                     table.insert(rewardsList, string.format("• %s: +%s (%s)", child.Name, tostring(delta), tostring(child.Value)))
-                    if child.Name:lower():find("gem") or child.Name:lower():find("token") then
+                    if child.Name:lower():find("gem") or child.Name:lower():find("token") or child.Name:lower():find("crate") then
                         isRareDrop = true
                     end
                 end
@@ -226,6 +303,12 @@ local function sendDiscordWebhook(isVictory, wavesBeaten, isTest)
 
     scanForDeltas(LocalPlayer:FindFirstChild("leaderstats"))
     scanForDeltas(LocalPlayer:FindFirstChild("Currencies"))
+    scanForDeltas(LocalPlayer:FindFirstChild("Data"))
+
+    local guiRewards = scanEndScreenRewards()
+    for _, r in ipairs(guiRewards) do
+        table.insert(rewardsList, r)
+    end
 
     if isTest and #rewardsList == 0 then
         table.insert(rewardsList, "• Coins: +500 (1500)")
@@ -235,9 +318,15 @@ local function sendDiscordWebhook(isVictory, wavesBeaten, isTest)
     local rewardsText = #rewardsList > 0 and table.concat(rewardsList, "\n") or "• 通關獎勵結算中"
     local playerName = UserConfig.webhookHideName and ("||" .. LocalPlayer.Name .. "||") or LocalPlayer.Name
 
+    local waveDisplay = string.format("Wave %d / %d %s", 
+        wavesBeaten or highestWaveReached, 
+        currentMatchMaxWave, 
+        isVictory and "(通關)" or "(失敗)"
+    )
+
     local fieldsList = {
         { name = "玩家", value = playerName, inline = true },
-        { name = "波次進度", value = string.format("Wave %s", tostring(wavesBeaten or 20)), inline = true },
+        { name = "波次進度", value = waveDisplay, inline = true },
         { name = "戰鬥狀態", value = string.format("結果: %s\n地圖: %s\n耗時: %s", isVictory and "勝利 (Victory)" or "失敗 (Defeat)", mapName, formatTime(matchDuration)), inline = false },
         { name = "獲得獎勵", value = rewardsText, inline = false }
     }
@@ -281,8 +370,41 @@ local function sendDiscordWebhook(isVictory, wavesBeaten, isTest)
 end
 
 -- --------------------------------------------------------
--- 3. 巨集檔案序列化
+-- 4. 座標輔助與巨集檔案序列化
 -- --------------------------------------------------------
+local function getInstancePosition(inst)
+    if not inst or typeof(inst) ~= "Instance" then return nil end
+    local pos = nil
+    pcall(function()
+        if inst:IsA("Model") then
+            pos = inst:GetPivot().Position
+        elseif inst:IsA("BasePart") then
+            pos = inst.Position
+        end
+    end)
+    return pos
+end
+
+local function findNearestTower(targetPos, maxDist)
+    local bestTower = nil
+    local minDistance = maxDist or 6
+    local towersFolder = workspace:FindFirstChild("Towers")
+
+    if towersFolder and targetPos then
+        for _, child in ipairs(towersFolder:GetChildren()) do
+            local pos = getInstancePosition(child)
+            if pos then
+                local dist = (pos - targetPos).Magnitude
+                if dist < minDistance then
+                    minDistance = dist
+                    bestTower = child
+                end
+            end
+        end
+    end
+    return bestTower
+end
+
 local function serializeActions(actions)
     local serialized = {}
     for _, step in ipairs(actions) do
@@ -290,6 +412,8 @@ local function serializeActions(actions)
         if step.type == "Place" then
             item.towerName = step.towerName
             item.cframe = {step.cframe:GetComponents()}
+            item.remoteName = step.remoteName
+            item.isEvent = step.isEvent
         elseif step.type == "Upgrade" or step.type == "Sell" then
             item.position = step.position and {step.position.X, step.position.Y, step.position.Z} or nil
             item.towerName = step.towerName
@@ -307,7 +431,9 @@ local function deserializeActions(data)
                 type = "Place",
                 delay = item.delay or 0,
                 towerName = item.towerName,
-                cframe = CFrame.new(unpack(item.cframe))
+                cframe = CFrame.new(unpack(item.cframe)),
+                remoteName = item.remoteName or "PlaceTower",
+                isEvent = item.isEvent or false
             })
         elseif (item.type == "Upgrade" or item.type == "Sell") and item.position then
             table.insert(actions, {
@@ -380,7 +506,7 @@ local function deleteCurrentMacro()
 end
 
 -- --------------------------------------------------------
--- 4. Hook 動作捕捉 (PlaceTower / UpgradeTower / SellTower)
+-- 5. 全相容 Hook 動作捕捉 (放塔 / 升級 / 賣塔)
 -- --------------------------------------------------------
 local oldNamecall
 oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
@@ -388,37 +514,61 @@ oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
     local args = {...}
 
     if isRecording and not isPlaying and not checkcaller() then
-        if method == "InvokeServer" or method == "invokeServer" then
-            if self and self.Name == "PlaceTower" then
+        if method == "InvokeServer" or method == "invokeServer" or method == "FireServer" or method == "fireServer" then
+            local rName = self and self.Name or ""
+            local lowerName = string.lower(rName)
+
+            -- 1. 全通用放塔捕捉 (相容 PlaceTower, PlaceTitan, SpawnTower, PlaceUnit 等所有單位)
+            if lowerName:find("place") or lowerName:find("spawn") or lowerName:find("summon") then
+                -- 自動從參數中搜尋 CFrame 與塔名稱
+                local targetCFrame = nil
+                local targetTowerName = "Unknown Tower"
+
+                for _, arg in ipairs(args) do
+                    if typeof(arg) == "CFrame" then
+                        targetCFrame = arg
+                    elseif typeof(arg) == "string" and targetTowerName == "Unknown Tower" then
+                        targetTowerName = arg
+                    end
+                end
+
+                if targetCFrame then
+                    local now = os.clock()
+                    local delay = (#recordedActions == 0) and 0 or (now - lastActionTime)
+                    lastActionTime = now
+
+                    table.insert(recordedActions, {
+                        type = "Place",
+                        delay = delay,
+                        towerName = targetTowerName,
+                        cframe = targetCFrame,
+                        remoteName = rName,
+                        isEvent = (method == "FireServer" or method == "fireServer")
+                    })
+                    print(string.format("[ATD 捕捉] 放塔: %s (Remote: %s, 步數: %d)", tostring(targetTowerName), rName, #recordedActions))
+                end
+
+            -- 2. 升級塔捕捉 (附帶 0.3s 連點防抖)
+            elseif lowerName:find("upgradetower") or lowerName == "upgrade" then
                 local now = os.clock()
-                local delay = (#recordedActions == 0) and 0 or (now - lastActionTime)
-                lastActionTime = now
+                if (now - lastActionTime) > 0.25 then
+                    local delay = (#recordedActions == 0) and 0 or (now - lastActionTime)
+                    lastActionTime = now
 
-                table.insert(recordedActions, {
-                    type = "Place",
-                    delay = delay,
-                    towerName = args[1],
-                    cframe = args[2]
-                })
-                print(string.format("[ATD 捕捉] 放塔: %s (步數: %d)", tostring(args[1]), #recordedActions))
+                    local inst = args[1]
+                    local pos = getInstancePosition(inst)
 
-            elseif self and self.Name == "UpgradeTower" then
-                local now = os.clock()
-                local delay = (#recordedActions == 0) and 0 or (now - lastActionTime)
-                lastActionTime = now
+                    table.insert(recordedActions, {
+                        type = "Upgrade",
+                        delay = delay,
+                        position = pos,
+                        towerName = inst and inst.Name or "Tower"
+                    })
+                    print(string.format("[ATD 捕捉] 升級: %s (步數: %d)", tostring(inst and inst.Name), #recordedActions))
+                end
 
-                local inst = args[1]
-                local pos = getInstancePosition(inst)
-
-                table.insert(recordedActions, {
-                    type = "Upgrade",
-                    delay = delay,
-                    position = pos,
-                    towerName = inst and inst.Name or "Tower"
-                })
-                print(string.format("[ATD 捕捉] 升級: %s (步數: %d)", tostring(inst and inst.Name), #recordedActions))
-
-            elseif self and self.Name == "SellTower" then
+            -- 3. 賣塔捕捉
+            elseif lowerName:find("selltower") or lowerName == "sell" then
                 local now = os.clock()
                 local delay = (#recordedActions == 0) and 0 or (now - lastActionTime)
                 lastActionTime = now
@@ -442,7 +592,7 @@ oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
 end))
 
 -- --------------------------------------------------------
--- 5. 自動守護線程 (Auto Play + Auto Skip + Auto Replay + Webhook)
+-- 6. 自動守護線程 (進圖重播 + 自動跳波 + 重開 + 結算戰報)
 -- --------------------------------------------------------
 task.spawn(function()
     task.wait(1.5)
@@ -455,37 +605,15 @@ task.spawn(function()
     while _G.Suite7414_NewGame_Running do
         task.wait(0.5)
 
-        local currentWave = getCurrentWave()
-        local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
-        local isGameOver = false
-        local isWin = false
+        local curW, maxW = updateWaveInfo()
+        local isGameOver, isWin = checkGameResult()
 
-        if playerGui then
-            for _, gui in ipairs(playerGui:GetChildren()) do
-                if gui:IsA("ScreenGui") and gui.Enabled then
-                    local victoryFrame = gui:FindFirstChild("Victory", true)
-                    local endFrame = gui:FindFirstChild("EndScreen", true) 
-                        or gui:FindFirstChild("GameOver", true)
-                        or gui:FindFirstChild("Replay", true)
-                        or gui:FindFirstChild("ReplayVote", true)
-
-                    if victoryFrame and (victoryFrame:IsA("GuiObject") and victoryFrame.Visible) then
-                        isGameOver = true
-                        isWin = true
-                        break
-                    elseif endFrame and (endFrame:IsA("GuiObject") and endFrame.Visible) then
-                        isGameOver = true
-                        break
-                    end
-                end
-            end
-        end
-
-        -- 1. 進圖自動重播
-        if currentWave and currentWave >= 1 and not isGameOver then
+        -- 1. 開局自動執行巨集
+        if curW and curW >= 1 and not isGameOver then
             if not hasAutoPlayedThisMatch then
                 hasAutoPlayedThisMatch = true
                 hasTriggeredReplay = false
+                highestWaveReached = curW
                 matchStartTime = os.time()
                 snapshotCurrencies()
 
@@ -498,14 +626,14 @@ task.spawn(function()
                     end)
                 end
             end
-        elseif isGameOver or (currentWave and currentWave == 0) then
+        elseif isGameOver or (curW and curW == 0) then
             hasAutoPlayedThisMatch = false
         end
 
-        -- 2. 自動跳波 (SkipWaveVote: currentWave + 1)
+        -- 2. 自動跳波 (投票下一個波次 curW + 1)
         if UserConfig.autoSkip and not isGameOver then
-            if currentWave then
-                local targetNextWave = currentWave + 1
+            if curW then
+                local targetNextWave = curW + 1
                 local now = os.clock()
 
                 if targetNextWave ~= lastVotedNextWave or (now - lastVoteTime > 1.2) then
@@ -517,12 +645,13 @@ task.spawn(function()
                         if skipEvent then skipEvent:FireServer(targetNextWave) end
                     end)
 
+                    local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
                     if playerGui then
                         for _, obj in ipairs(playerGui:GetDescendants()) do
                             if obj:IsA("GuiButton") or obj:IsA("TextLabel") then
                                 if obj.Text and obj.Text:find("自動跳過") then
                                     local btn = obj:IsA("GuiButton") and obj or obj:FindFirstAncestorWhichIsA("GuiButton")
-                                    if btn and btn.Visible then
+                                    if btn and isGuiElementVisible(btn) then
                                         pcall(function()
                                             if firesignal then
                                                 firesignal(btn.Activated)
@@ -538,13 +667,18 @@ task.spawn(function()
             end
         end
 
-        -- 3. 自動重開與 Webhook 結算推播
+        -- 3. 結算推播與自動重開
         if isGameOver and not hasTriggeredReplay then
             hasTriggeredReplay = true
             _G.Suite7414_MatchesPlayed = _G.Suite7414_MatchesPlayed + 1
-            if isWin then _G.Suite7414_Wins = _G.Suite7414_Wins + 1 else _G.Suite7414_Losses = _G.Suite7414_Losses + 1 end
+            if isWin then 
+                _G.Suite7414_Wins = _G.Suite7414_Wins + 1 
+            else 
+                _G.Suite7414_Losses = _G.Suite7414_Losses + 1 
+            end
 
-            sendDiscordWebhook(isWin, currentWave, false)
+            print(string.format("[ATD 結算] 結果: %s (波次: %d/%d)，推送 Webhook！", isWin and "勝利" or "失敗", highestWaveReached, currentMatchMaxWave))
+            sendDiscordWebhook(isWin, highestWaveReached, false)
 
             if UserConfig.autoReplay then
                 task.spawn(function()
@@ -565,7 +699,7 @@ task.spawn(function()
 end)
 
 -- --------------------------------------------------------
--- 6. 巨集重播核心 (流暢原生節奏 + 等錢秒放 + 等錢秒升)
+-- 7. 巨集重播核心 (等錢秒放 + 等錢秒升 + 精準賣塔)
 -- --------------------------------------------------------
 runPlayMacro = function(st)
     if isRecording then
@@ -602,17 +736,21 @@ runPlayMacro = function(st)
 
                 if not isPlaying or not _G.Suite7414_NewGame_Running then break end
 
-                local rfFolder = ReplicatedStorage:FindFirstChild("RemoteFunctions")
-                if not rfFolder then break end
-
-                -- 1. 放塔
+                -- 1. 放塔 (自動尋找對應的 RemoteFunction 或 RemoteEvent)
                 if step.type == "Place" then
-                    local placeFunc = rfFolder:FindFirstChild("PlaceTower")
-                    if placeFunc then
+                    local rTarget = (ReplicatedStorage:FindFirstChild("RemoteFunctions") and ReplicatedStorage.RemoteFunctions:FindFirstChild(step.remoteName or "PlaceTower"))
+                        or (ReplicatedStorage:FindFirstChild("RemoteEvents") and ReplicatedStorage.RemoteEvents:FindFirstChild(step.remoteName or "PlaceTower"))
+
+                    if rTarget then
                         while isPlaying and _G.Suite7414_NewGame_Running do
                             local res = nil
                             pcall(function()
-                                res = placeFunc:InvokeServer(step.towerName, step.cframe)
+                                if rTarget:IsA("RemoteFunction") then
+                                    res = rTarget:InvokeServer(step.towerName, step.cframe)
+                                else
+                                    rTarget:FireServer(step.towerName, step.cframe)
+                                    res = true
+                                end
                             end)
 
                             local spawnedTower = findNearestTower(step.cframe.Position, 5)
@@ -627,19 +765,26 @@ runPlayMacro = function(st)
 
                 -- 2. 升級 (等錢秒升)
                 elseif step.type == "Upgrade" then
-                    local upgradeFunc = rfFolder:FindFirstChild("UpgradeTower")
+                    local upgradeFunc = (ReplicatedStorage:FindFirstChild("RemoteFunctions") and ReplicatedStorage.RemoteFunctions:FindFirstChild("UpgradeTower"))
+                        or (ReplicatedStorage:FindFirstChild("RemoteEvents") and ReplicatedStorage.RemoteEvents:FindFirstChild("UpgradeTower"))
+
                     if upgradeFunc and step.position then
                         while isPlaying and _G.Suite7414_NewGame_Running do
                             local target = findNearestTower(step.position, 6)
                             if target then
                                 local res = nil
                                 pcall(function()
-                                    res = upgradeFunc:InvokeServer(target)
+                                    if upgradeFunc:IsA("RemoteFunction") then
+                                        res = upgradeFunc:InvokeServer(target)
+                                    else
+                                        upgradeFunc:FireServer(target)
+                                        res = true
+                                    end
                                 end)
 
                                 if res ~= false and res ~= nil then
                                     print(string.format("[ATD 升級成功] (%d/%d) %s", i, #recordedActions, tostring(step.towerName)))
-                                    task.wait(0.3)
+                                    task.wait(0.35)
                                     break
                                 end
                             end
@@ -649,12 +794,20 @@ runPlayMacro = function(st)
 
                 -- 3. 販賣
                 elseif step.type == "Sell" then
-                    local sellFunc = rfFolder:FindFirstChild("SellTower")
+                    local sellFunc = (ReplicatedStorage:FindFirstChild("RemoteFunctions") and ReplicatedStorage.RemoteFunctions:FindFirstChild("SellTower"))
+                        or (ReplicatedStorage:FindFirstChild("RemoteEvents") and ReplicatedStorage.RemoteEvents:FindFirstChild("SellTower"))
+
                     if sellFunc and step.position then
                         while isPlaying and _G.Suite7414_NewGame_Running do
                             local target = findNearestTower(step.position, 6)
                             if target then
-                                pcall(function() sellFunc:InvokeServer(target) end)
+                                pcall(function()
+                                    if sellFunc:IsA("RemoteFunction") then
+                                        sellFunc:InvokeServer(target)
+                                    else
+                                        sellFunc:FireServer(target)
+                                    end
+                                end)
                                 print(string.format("[ATD 賣塔成功] (%d/%d) %s", i, #recordedActions, tostring(step.towerName)))
                                 task.wait(0.25)
                                 break
@@ -683,7 +836,7 @@ runPlayMacro = function(st)
 end
 
 -- --------------------------------------------------------
--- 7. UI 介面構建 (粉色主題 4 分頁)
+-- 8. UI 介面構建 (粉色主題 4 分頁)
 -- --------------------------------------------------------
 local parentGui = (gethui and gethui()) or CoreGui:FindFirstChild("RobloxGui") or LocalPlayer:WaitForChild("PlayerGui")
 if parentGui:FindFirstChild("Suite7414UI") then
@@ -1179,7 +1332,7 @@ registerAccent(testBtn)
 Instance.new("UICorner", testBtn).CornerRadius = UDim.new(0, 5)
 
 testBtn.MouseButton1Click:Connect(function()
-    print("[Webhook] 正在測試推播...")
+    print("[Webhook] 正在發送測試推播...")
     sendDiscordWebhook(true, 20, true)
 end)
 
@@ -1301,7 +1454,7 @@ createSwitch(pageSettings, "手機端懸浮按鈕", "在畫面左下角顯示一
     if mobileBtn then mobileBtn.Visible = st end
 end, 3)
 
--- 側邊導航 (4 大分頁)
+-- 側邊導航
 local navTabs = {
     { Name = "Macro 控制", Page = pageMacro },
     { Name = "自動化功能", Page = pageAutomation },
