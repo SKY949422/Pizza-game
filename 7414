@@ -1,6 +1,6 @@
 -- ========================================================
--- [ 7414 TD MACRO SUITE - Alliance Tower Defense 終極版 ]
--- PlaceTower + UpgradeTower + SellTower + AutoReplay + AutoSkip
+-- [ 7414 TD MACRO SUITE - Alliance Tower Defense 終極修復版 ]
+-- PlaceTower + UpgradeTower + SellTower + AutoReplay + AutoSkip (NextWave 修正)
 -- ========================================================
 
 if _G.Suite7414_NewGame_Running then
@@ -81,20 +81,27 @@ local function findNearestTower(targetPos, maxDist)
     return bestTower
 end
 
--- 動態抓取當前波次編號
+-- 精準抓取當前波次 (解析 "Wave 2/20" 或數值)
 local function getCurrentWave()
-    if workspace:FindFirstChild("Info") and workspace.Info:FindFirstChild("Wave") then
-        return tonumber(workspace.Info.Wave.Value)
+    local info = workspace:FindFirstChild("Info") or workspace:FindFirstChild("GameInfo")
+    if info then
+        local w = info:FindFirstChild("Wave") or info:FindFirstChild("CurrentWave")
+        if w and w:IsA("ValueBase") and tonumber(w.Value) then
+            return tonumber(w.Value)
+        end
     end
     if workspace:FindFirstChild("Wave") and workspace.Wave:IsA("ValueBase") then
         return tonumber(workspace.Wave.Value)
     end
+
     local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
     if playerGui then
         for _, obj in ipairs(playerGui:GetDescendants()) do
             if obj:IsA("TextLabel") and obj.Visible then
-                local w = obj.Text:match("[Ww]ave%s*[:%-]?%s*(%d+)") or obj.Text:match("(%d+)%s*/%s*%d+")
-                if w then return tonumber(w) end
+                local wMatch = obj.Text:match("[Ww]ave%s*(%d+)%s*/") or obj.Text:match("[Ww]ave%s*[:%-]?%s*(%d+)")
+                if wMatch then
+                    return tonumber(wMatch)
+                end
             end
         end
     end
@@ -241,7 +248,6 @@ oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
 
     if isRecording and not isPlaying and not checkcaller() then
         if method == "InvokeServer" or method == "invokeServer" then
-            -- 1. 放塔
             if self and self.Name == "PlaceTower" then
                 local now = os.clock()
                 local delay = (#recordedActions == 0) and 0 or (now - lastActionTime)
@@ -255,7 +261,6 @@ oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
                 })
                 print(string.format("[ATD 捕捉] 放塔: %s (步數: %d)", tostring(args[1]), #recordedActions))
 
-            -- 2. 升級塔
             elseif self and self.Name == "UpgradeTower" then
                 local now = os.clock()
                 local delay = (#recordedActions == 0) and 0 or (now - lastActionTime)
@@ -272,7 +277,6 @@ oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
                 })
                 print(string.format("[ATD 捕捉] 升級: %s (步數: %d)", tostring(inst and inst.Name), #recordedActions))
 
-            -- 3. 賣塔
             elseif self and self.Name == "SellTower" then
                 local now = os.clock()
                 local delay = (#recordedActions == 0) and 0 or (now - lastActionTime)
@@ -297,36 +301,58 @@ oldNamecall = hookmetamethod(game, "__namecall", newcclosure(function(self, ...)
 end))
 
 -- --------------------------------------------------------
--- 4. 自動守護線程 (Auto Skip & Auto Replay)
+-- 4. 自動守護線程 (Auto Skip 次輪投票 + Auto Replay)
 -- --------------------------------------------------------
 task.spawn(function()
     task.wait(2.0)
     local hasTriggeredReplay = false
-    local lastVotedWave = -1
+    local lastVotedNextWave = -1
+    local lastVoteTime = 0
 
     while _G.Suite7414_NewGame_Running do
-        task.wait(0.6)
+        task.wait(0.5)
 
-        -- 1. 自動跳波 (Auto Skip)
+        -- 1. 自動跳波 (Auto Skip: 傳送 NextWave = currentWave + 1)
         if UserConfig.autoSkip then
             local currentWave = getCurrentWave()
-            if currentWave and currentWave ~= lastVotedWave then
-                pcall(function()
-                    local skipEvent = ReplicatedStorage:FindFirstChild("RemoteEvents") and ReplicatedStorage.RemoteEvents:FindFirstChild("SkipWaveVote")
-                    if skipEvent then
-                        skipEvent:FireServer(currentWave)
-                        lastVotedWave = currentWave
-                        print(string.format("[Auto Skip] 已自動發送跳波投票 (Wave %d)", currentWave))
+            if currentWave then
+                local targetNextWave = currentWave + 1
+                local now = os.clock()
+
+                -- 每 1.2 秒持續嘗試投票跳過，直到波次成功前進
+                if targetNextWave ~= lastVotedNextWave or (now - lastVoteTime > 1.2) then
+                    lastVoteTime = now
+                    lastVotedNextWave = targetNextWave
+
+                    -- 方法 A: 遠程觸發 SkipWaveVote(currentWave + 1)
+                    pcall(function()
+                        local skipEvent = ReplicatedStorage:FindFirstChild("RemoteEvents") and ReplicatedStorage.RemoteEvents:FindFirstChild("SkipWaveVote")
+                        if skipEvent then
+                            skipEvent:FireServer(targetNextWave)
+                            print(string.format("[Auto Skip] 發送投票 -> 跳至第 %d 回合 (當前第 %d 回合)", targetNextWave, currentWave))
+                        end
+                    end)
+
+                    -- 方法 B: 雙重保險，模擬點擊畫面上的「自動跳過」紅色按鈕
+                    local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+                    if playerGui then
+                        for _, obj in ipairs(playerGui:GetDescendants()) do
+                            if obj:IsA("GuiButton") or obj:IsA("TextLabel") then
+                                if obj.Text and obj.Text:find("自動跳過") then
+                                    local btn = obj:IsA("GuiButton") and obj or obj:FindFirstAncestorWhichIsA("GuiButton")
+                                    if btn and btn.Visible then
+                                        pcall(function()
+                                            if firesignal then
+                                                firesignal(btn.Activated)
+                                                firesignal(btn.MouseButton1Click)
+                                            end
+                                        end)
+                                    end
+                                end
+                            end
+                        end
                     end
-                end)
-            elseif not currentWave then
-                -- 若無法取得具體波次，定時輔助觸發
-                pcall(function()
-                    local skipEvent = ReplicatedStorage:FindFirstChild("RemoteEvents") and ReplicatedStorage.RemoteEvents:FindFirstChild("SkipWaveVote")
-                    if skipEvent then
-                        skipEvent:FireServer(1)
-                    end
-                end)
+                end
             end
         end
 
@@ -822,7 +848,7 @@ task.spawn(function()
 end)
 
 -- ==================== 2. Automation 頁面 ====================
-createSwitch(pageAutomation, "自動跳過波次 (Auto Skip)", "波次刷新時自動向 SkipWaveVote 發送投票跳過", UserConfig.autoSkip, function(st)
+createSwitch(pageAutomation, "自動跳過波次 (Auto Skip)", "自動向 SkipWaveVote 投票跳入下一波並模擬按鈕點擊", UserConfig.autoSkip, function(st)
     UserConfig.autoSkip = st
     saveUserConfig()
 end, 1)
